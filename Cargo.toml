@@ -1,0 +1,38 @@
+[package]
+name = "lan-transfer"
+version = "0.3.0"
+edition = "2021"
+description = "邻传 · 轻量局域网文件传输"
+
+[dependencies]
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+if-addrs = "0.15"
+tempfile = "3"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.20"
+rfd = "0.15"
+directories = "6"
+open = "5"
+arboard = { version = "3", default-features = false }
+raw-window-handle = "0.6"
+
+[features]
+# Fake devices and transfers for screenshots: LAN_TRANSFER_DEMO=<scene>.
+demo = []
+
+# Turns off winit's default menu so ⌘Q asks before quitting.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false }
+
+# Development builds on Linux (the release targets are macOS and Windows).
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
