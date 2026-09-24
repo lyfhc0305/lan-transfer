@@ -1,0 +1,36 @@
+{
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "architecture": "arm64",
+  "scope": "Release Rust core, one Mac loopback; no UI, not LAN or Windows measurements",
+  "checks": [
+    "UDP discovery (unicast query over loopback)",
+    "Unicode filename and SHA-256 integrity",
+    "Duplicate filename does not overwrite",
+    "Zero-byte file",
+    "Wrong key rejected",
+    "Recovery after interrupted connection",
+    "64 MiB and 512 MiB encrypted transfers match SHA-256"
+  ],
+  "idle": {
+    "seconds": 15.16,
+    "rss_mib": 1.91,
+    "average_cpu_percent": 0.0
+  },
+  "transfers": [
+    {
+      "size_mib": 64,
+      "seconds": 0.274,
+      "throughput_mib_s": 233.2,
+      "receiver_peak_sampled_rss_mib": 2.36,
+      "receiver_average_cpu_percent": 91.1
+    },
+    {
+      "size_mib": 512,
+      "seconds": 1.822,
+      "throughput_mib_s": 280.9,
+      "receiver_peak_sampled_rss_mib": 2.36,
+      "receiver_average_cpu_percent": 98.2
+    }
+  ],
+  "binary_mib": 0.48
+}
