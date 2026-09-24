@@ -301,6 +301,29 @@ fn text_is_delivered_without_files() {
 }
 
 #[test]
+fn unread_texts_are_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let receiver = shared(&dir.path().join("recv"));
+    let sender = shared(dir.path());
+    for i in 0..8 {
+        let (addr, h) = one_server(receiver.clone());
+        let t = send_now(&sender, addr, Payload::Text(format!("第 {i} 条")));
+        assert_eq!(t.stage, Stage::Done, "{}", t.detail);
+        assert!(h.join().unwrap());
+        // The message is stored after the reply goes out; do not race it.
+        wait_for(|| receiver.messages.lock().unwrap().len() == i + 1);
+    }
+    assert_eq!(receiver.messages.lock().unwrap().len(), 8);
+    // The ninth arrives while none has been read: declined with a reason.
+    let (addr, h) = one_server(receiver.clone());
+    let t = send_now(&sender, addr, Payload::Text("再来一条".into()));
+    assert_eq!(t.stage, Stage::Declined);
+    assert!(t.detail.contains("未读"), "{}", t.detail);
+    // Like other declined texts, the handler ends with an error.
+    assert!(!h.join().unwrap());
+}
+
+#[test]
 fn paused_or_trusted_only_receivers_decline_with_a_reason() {
     for (paused, reason) in [(true, "关闭接收"), (false, "已信任")] {
         let dir = tempfile::tempdir().unwrap();
@@ -464,6 +487,33 @@ fn unsafe_requests_are_refused_before_touching_the_disk() {
 }
 
 #[test]
+fn the_sender_is_told_why_a_transfer_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("recv");
+    let receiver = shared(&dest);
+    let (addr, h) = one_server(receiver.clone());
+    let mut ch = raw_client(addr, vec![file("f.bin", 4)]);
+    wait_for(|| !receiver.requests.lock().unwrap().is_empty());
+    receiver.requests.lock().unwrap()[0]
+        .decision
+        .send(Answer {
+            accept: true,
+            trust: false,
+        })
+        .unwrap();
+    let reply: Reply = ch.recv_json(4096).unwrap();
+    assert!(reply.accept);
+    ch.send(b"data").unwrap();
+    ch.send(&[9; 32]).unwrap();
+    let receipt: Receipt = ch.recv_json(4096).unwrap();
+    assert!(!receipt.ok, "the failure is reported, not a bare drop");
+    assert!(receipt.reason.contains("校验"), "{}", receipt.reason);
+    drop(ch);
+    assert!(!h.join().unwrap());
+    assert!(tree(&dest).is_empty());
+}
+
+#[test]
 fn broken_uploads_leave_no_partial_files() {
     for mode in ["partial", "hash", "long", "cancel", "garbage"] {
         let dir = tempfile::tempdir().unwrap();
@@ -547,6 +597,35 @@ fn folders_skip_links_and_system_files() {
     fs::create_dir_all(other.join("项目")).unwrap();
     let (list, _) = scan(&[root, other.join("项目")], &AtomicBool::new(false)).unwrap();
     assert!(list.iter().any(|s| s.entry.path == "项目 (2)"));
+    // A link picked on its own is skipped as well, not sent as a folder.
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("入口");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let e = scan(std::slice::from_ref(&link), &AtomicBool::new(false))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "没有可以发送的文件");
+    }
+}
+
+#[test]
+fn one_address_cannot_hold_every_connection() {
+    let mut per_ip: HashMap<IpAddr, usize> = HashMap::new();
+    let a: IpAddr = "192.168.1.10".parse().unwrap();
+    let b: IpAddr = "192.168.1.11".parse().unwrap();
+    for _ in 0..3 {
+        assert!(admit(&mut per_ip, a, 3));
+    }
+    assert!(!admit(&mut per_ip, a, 3), "same address is refused");
+    assert!(admit(&mut per_ip, b, 3), "other addresses are unaffected");
+    release(&mut per_ip, a);
+    assert!(admit(&mut per_ip, a, 3), "a slot frees up after a release");
+    release(&mut per_ip, b);
+    release(&mut per_ip, b);
+    release(&mut per_ip, b);
+    release(&mut per_ip, b);
+    assert_eq!(per_ip.get(&b), None, "the entry is dropped at zero");
 }
 
 #[test]
