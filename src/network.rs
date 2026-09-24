@@ -22,7 +22,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -32,10 +32,16 @@ const CHUNK: usize = 64_000;
 pub const MAX_ENTRIES: usize = 10_000;
 const MAX_FILE: u64 = 100 * 1024 * 1024 * 1024;
 pub const MAX_TEXT: usize = 256 * 1024;
+/// Unread texts held at once: each one opens a dialog and brings the window
+/// forward, so a peer must not be able to stack up arbitrarily many.
+const MAX_PENDING_TEXTS: usize = 8;
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_DEPTH: usize = 64;
-const MAX_OFFER: usize = 8 * 1024 * 1024;
+const MAX_OFFER: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 8;
+/// Concurrent connections accepted from a single address, so one computer
+/// cannot hold every receiving slot (see the comment on [`MAX_CONNECTIONS`]).
+const MAX_PER_IP: usize = 3;
 
 /// One file or folder in a batch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -267,7 +273,9 @@ fn scan(paths: &[PathBuf], cancel: &AtomicBool) -> Result<(Vec<Source>, usize)> 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let meta = fs::metadata(path)
+        // The link itself is not sent, so its target must not be followed
+        // here either; walk() skips links the same way.
+        let meta = fs::symlink_metadata(path)
             .map_err(|e| fail(format!("无法读取「{shown}」：{}", describe(&e))))?;
         let name = path
             .file_name()
@@ -619,20 +627,57 @@ pub fn start_receiver(shared: Arc<Shared>) {
 /// Accept connections on `listener` until the process ends.
 pub fn serve(listener: TcpListener, shared: Arc<Shared>) {
     let count = Arc::new(AtomicUsize::new(0));
+    let per_ip: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     for s in listener.incoming() {
         let Ok(s) = s else {
+            // A listener stuck on errors (out of file descriptors) must not
+            // spin at full speed.
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let Ok(addr) = s.peer_addr() else {
             continue;
         };
         if count.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
             count.fetch_sub(1, Ordering::Relaxed);
             continue;
         }
+        {
+            let mut per_ip = per_ip.lock().unwrap();
+            if !admit(&mut per_ip, addr.ip(), MAX_PER_IP) {
+                drop(per_ip);
+                count.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            }
+        }
         let shared = shared.clone();
         let count = count.clone();
+        let per_ip = per_ip.clone();
         std::thread::spawn(move || {
             let _ = handle(s, &shared);
             count.fetch_sub(1, Ordering::Relaxed);
+            release(&mut per_ip.lock().unwrap(), addr.ip());
         });
+    }
+}
+
+/// Count a connection from `ip` against its per-address limit.
+fn admit(per_ip: &mut HashMap<IpAddr, usize>, ip: IpAddr, limit: usize) -> bool {
+    let n = per_ip.entry(ip).or_insert(0);
+    if *n >= limit {
+        false
+    } else {
+        *n += 1;
+        true
+    }
+}
+
+fn release(per_ip: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
+    if let Some(n) = per_ip.get_mut(&ip) {
+        *n -= 1;
+        if *n == 0 {
+            per_ip.remove(&ip);
+        }
     }
 }
 
@@ -684,6 +729,13 @@ fn receive_text(
         })?;
         return Err(fail("文字为空或过长"));
     }
+    if shared.messages.lock().unwrap().len() >= MAX_PENDING_TEXTS {
+        ch.send_json(&Reply {
+            accept: false,
+            reason: "对方有太多未读的文字".into(),
+        })?;
+        return Err(fail("未读文字过多，已拒收"));
+    }
     ch.send_json(&Reply {
         accept: true,
         reason: String::new(),
@@ -729,6 +781,7 @@ fn receive_files(
     let (id, cancel) = shared.add(t);
     let _watch = watch_cancel(ch.stream(), &cancel)?;
     let mut saved = vec![];
+    let mut accepted = false;
     let outcome = (|| -> Result<()> {
         if !trusted {
             let (tx, rx) = mpsc::sync_channel(1);
@@ -786,6 +839,7 @@ fn receive_files(
             accept: true,
             reason: String::new(),
         })?;
+        accepted = true;
         shared.update(id, |t| t.stage = Stage::Running);
         configure(ch.stream(), Duration::from_secs(30))?;
         receive_entries(&mut ch, shared, id, &cancel, folder, &entries, &mut saved)?;
@@ -795,6 +849,19 @@ fn receive_files(
         })?;
         Ok(())
     })();
+    // After the accept reply, tell the sender why the batch failed; until
+    // then the decline itself is the answer. Best effort: the socket may
+    // already be gone (the sender quit or cancelled).
+    if accepted {
+        if let Err(e) = &outcome {
+            let reason = if cancel.load(Ordering::Relaxed) {
+                "对方已取消接收".to_owned()
+            } else {
+                describe(e.as_ref())
+            };
+            let _ = ch.send_json(&Receipt { ok: false, reason });
+        }
+    }
     shared.update(id, |t| {
         t.saved = saved.clone();
         conclude(t, &outcome, &cancel);

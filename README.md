@@ -36,7 +36,7 @@ Mac 菜单栏 / Windows 系统托盘中的局域网文件互传工具。
 - `packaging/`：Windows 资源、清单及使用说明。
 - `scripts/`：构建打包、字体与图标生成。
 - `prototypes/`：早期命令行原型及其测试脚本存档。
-- `localsend/`：独立克隆的上游参考仓库。
+- `localsend/`：独立克隆的上游参考仓库（仅本地保留，未提交到版本库）。
 
 ## 构建与打包
 
@@ -55,7 +55,7 @@ python3 scripts/build_release.py
 
 ## 测试
 
-`cargo test --release -- --test-threads=1`，共 20 项，说明见 `tests/README.md`。
+`cargo test --release -- --test-threads=1`，共 23 项，说明见 `tests/README.md`。
 
 Linux 仅用于开发和测试：`Cargo.toml` 为 Linux 打开 eframe 的 X11 支持，Linux 版不显示托盘。截图用演示数据：`cargo build --release --features demo` 后以 `LAN_TRANSFER_DEMO=<场景>`（home、busy、text、transfers、settings、request、message、address、exit、toast、empty）和 `LAN_TRANSFER_THEME=dark` 启动；演示模式不收发任何数据。`LAN_TRANSFER_CONFIG_DIR` 可指定独立的设置目录。
 
