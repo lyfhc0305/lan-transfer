@@ -151,9 +151,22 @@ impl App {
         let Some(t) = self.shared.transfer(id) else {
             return;
         };
-        let Some((address, device)) = t.target.clone() else {
+        let Some((mut address, device)) = t.target.clone() else {
             return;
         };
+        // The device may have a new address by now.
+        if !device.is_empty() {
+            if let Some(p) = self
+                .shared
+                .peers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == device)
+            {
+                address = p.address;
+            }
+        }
         let payload = match &t.text {
             Some(text) => Payload::Text(text.clone()),
             None => Payload::Files(t.sources.clone()),
@@ -247,8 +260,8 @@ fn transfer_row(ui: &mut Ui, t: &Transfer) -> Option<Action> {
                     widgets::progress(ui, t.fraction(), p.accent);
                     ui.horizontal(|ui| {
                         let mut left = format!("{:.0}%", t.fraction() * 100.);
-                        if t.rate > 0. {
-                            left.push_str(&format!(" · {}/s", size(t.rate as u64)));
+                        if t.speed() > 0. {
+                            left.push_str(&format!(" · {}/s", size(t.speed() as u64)));
                         }
                         if let Some(eta) = t.eta() {
                             left.push_str(&format!(" · 剩余 {}", duration(eta)));
@@ -272,10 +285,11 @@ fn transfer_row(ui: &mut Ui, t: &Transfer) -> Option<Action> {
                     });
                 }
             } else {
-                let (glyph, text) = match t.stage {
-                    Stage::Done if t.outgoing => (Icon::Check, "已发送".to_owned()),
-                    Stage::Done => (Icon::Check, "已接收".to_owned()),
-                    Stage::Failed => (Icon::Warning, t.detail.clone()),
+                let (glyph, text) = match (t.stage, t.outgoing) {
+                    (Stage::Done, true) => (Icon::Check, "已发送".to_owned()),
+                    (Stage::Done, false) => (Icon::Check, "已接收".to_owned()),
+                    (Stage::Failed, true) => (Icon::Warning, "发送失败".to_owned()),
+                    (Stage::Failed, false) => (Icon::Warning, "接收失败".to_owned()),
                     _ => (Icon::Close, t.detail.clone()),
                 };
                 ui.horizontal_top(|ui| {
@@ -293,8 +307,13 @@ fn transfer_row(ui: &mut Ui, t: &Transfer) -> Option<Action> {
                             .selectable(false),
                     );
                 });
-                if t.stage == Stage::Done && !t.detail.is_empty() {
-                    ui.label(RichText::new(&t.detail).font(body(11.5)).color(p.muted));
+                // The reason in a quiet colour under the red / green verdict.
+                if matches!(t.stage, Stage::Done | Stage::Failed) && !t.detail.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(&t.detail).font(body(12.)).color(p.text_2))
+                            .wrap()
+                            .selectable(false),
+                    );
                 }
             }
         });

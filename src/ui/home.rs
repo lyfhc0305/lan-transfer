@@ -3,6 +3,13 @@ use super::*;
 use crate::network::{Payload, Target};
 use egui::{text::LayoutJob, TextEdit, TextFormat};
 
+/// Keyboard shortcut that sends text.
+const SEND_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "⌘ Enter"
+} else {
+    "Ctrl+Enter"
+};
+
 /// One entry of the device grid.
 struct Tile {
     key: String,
@@ -127,39 +134,28 @@ impl App {
                         if r.clicked() {
                             self.selected = Some(tile.key.clone());
                         }
-                        r.context_menu(|ui| {
-                            ui.set_min_width(200.);
-                            if tile.manual {
-                                if widgets::menu_item(ui, Icon::Trash, "移除此地址", true).clicked()
-                                {
-                                    remove = Some(tile.target.address);
-                                    ui.close_menu();
-                                }
-                            } else if tile.trusted {
-                                if widgets::menu_item(ui, Icon::Shield, "取消信任", false).clicked()
+                        // Trusting happens only in the request dialog, after
+                        // the handshake proved who the device is; the list
+                        // comes from unauthenticated broadcasts.
+                        if tile.manual || tile.trusted {
+                            r.context_menu(|ui| {
+                                ui.set_min_width(200.);
+                                if tile.manual {
+                                    if widgets::menu_item(ui, Icon::Trash, "移除此地址", true)
+                                        .clicked()
+                                    {
+                                        remove = Some(tile.target.address);
+                                        ui.close_menu();
+                                    }
+                                } else if widgets::menu_item(ui, Icon::Shield, "取消信任", false)
+                                    .clicked()
                                 {
                                     let id = tile.key.clone();
                                     self.change_settings(|s| s.trusted.retain(|t| t.id != id));
                                     ui.close_menu();
                                 }
-                            } else if widgets::menu_item(
-                                ui,
-                                Icon::ShieldCheck,
-                                "信任此设备（自动接收它发来的文件）",
-                                false,
-                            )
-                            .clicked()
-                            {
-                                network::trust(
-                                    &self.shared,
-                                    &tile.key,
-                                    &tile.name,
-                                    tile.platform,
-                                    &tile.target.address.ip().to_string(),
-                                );
-                                ui.close_menu();
-                            }
-                        });
+                            });
+                        }
                     } else if add_tile(ui, tile_w).clicked() {
                         self.open_address_dialog();
                     }
@@ -489,6 +485,12 @@ impl App {
                                         .font(body(12.))
                                         .color(color),
                                 );
+                                ui.add_space(8.);
+                                ui.label(
+                                    RichText::new(format!("{SEND_SHORTCUT} 发送"))
+                                        .font(body(12.))
+                                        .color(p.faint),
+                                );
                             });
                         });
                     });
@@ -517,13 +519,16 @@ impl App {
             (Some(t), true) => format!("发送给 {}", ellipsize(&t.name, 16)),
         };
         let enabled = target.is_some() && has_content;
-        let clicked = Button::primary(&label)
+        let tip = format!("{SEND_SHORTCUT} 发送");
+        let mut button = Button::primary(&label)
             .icon(Icon::ArrowUp)
             .enabled(enabled)
             .min_width(ui.available_width())
-            .height(42.)
-            .show(ui)
-            .clicked();
+            .height(42.);
+        if enabled && self.mode == Mode::Text {
+            button = button.tooltip(&tip);
+        }
+        let clicked = button.show(ui).clicked();
         // ⌘/Ctrl+Enter sends text; consumed so the editor does not add a line.
         let shortcut = enabled
             && self.mode == Mode::Text
@@ -628,8 +633,8 @@ impl App {
         );
         let more = if running.len() > 1 {
             format!("另有 {} 个", running.len() - 1)
-        } else if t.rate > 0. && t.stage == Stage::Running {
-            format!("{}/s", size(t.rate as u64))
+        } else if t.speed() > 0. {
+            format!("{}/s", size(t.speed() as u64))
         } else {
             String::new()
         };
@@ -643,9 +648,12 @@ impl App {
     }
 }
 
+/// Height of a device tile: avatar, up to two lines of name, and a label.
+const TILE_HEIGHT: f32 = 126.;
+
 fn device_tile(ui: &mut Ui, tile: &Tile, selected: bool, width: f32) -> egui::Response {
     let p = pal(ui);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 112.), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, TILE_HEIGHT), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, &tile.name)
     });
@@ -691,15 +699,21 @@ fn device_tile(ui: &mut Ui, tile: &Tile, selected: bool, width: f32) -> egui::Re
         );
         widgets::focus_ring(ui, &response, rect, widgets::RADIUS as f32);
     }
+    let mut tip = format!("{}\n{}", tile.name, tile.target.address.ip());
+    if tile.manual {
+        tip.push_str("\n右键可移除");
+    } else if tile.trusted {
+        tip.push_str("\n右键可取消信任");
+    }
     response
         .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(format!("{}\n{}", tile.name, tile.target.address.ip()))
+        .on_hover_text(tip)
 }
 
 /// "Connect by address" tile at the end of the grid.
 fn add_tile(ui: &mut Ui, width: f32) -> egui::Response {
     let p = pal(ui);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 112.), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, TILE_HEIGHT), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "输入 IP"));
     let hovered = response.hovered();
     let painter = ui.painter();

@@ -138,7 +138,23 @@ fn targets(shared: &Shared) -> Vec<SocketAddr> {
             ips.insert(ip);
         }
     }
-    ips.extend(shared.manual.lock().unwrap().iter().copied());
+    // Addresses typed in, until the device there shows up by itself.
+    let peers: Vec<IpAddr> = shared
+        .peers
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.address.ip())
+        .collect();
+    ips.extend(
+        shared
+            .manual
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ip| !peers.contains(ip))
+            .copied(),
+    );
     // Never probe ourselves by address.
     for own in local_addresses() {
         ips.remove(&IpAddr::V4(own));

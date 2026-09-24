@@ -12,13 +12,15 @@ serde_json = "1"
 sha2 = "0.10"
 if-addrs = "0.15"
 tempfile = "3"
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
 tray-icon = "0.20"
 rfd = "0.15"
 directories = "6"
 open = "5"
 arboard = { version = "3", default-features = false }
 raw-window-handle = "0.6"
+# System notifications while the window is hidden.
+notify-rust = { version = "4", default-features = false, features = ["z"] }
 
 [features]
 # Fake devices and transfers for screenshots: LAN_TRANSFER_DEMO=<scene>.
@@ -28,9 +30,13 @@ demo = []
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+# Free disk space (statvfs / statfs).
+libc = "0.2"
+
 # Development builds on Linux (the release targets are macOS and Windows).
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11"] }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "accesskit"] }
 
 [profile.release]
 strip = true
