@@ -279,25 +279,158 @@ fn existing_names_are_never_overwritten() {
 }
 
 #[test]
-fn text_is_delivered_without_files() {
+fn text_is_confirmed_like_files_and_delivered() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("recv");
     let sender = shared(dir.path());
     let receiver = shared(&dest);
-    let (addr, h) = one_server(receiver.clone());
     let text = "会议链接 https://example.com/room?id=42\n第二行";
+    // Unknown device: the text is shown for confirmation, not delivered.
+    let (addr, h) = one_server(receiver.clone());
+    let id = start(&sender, addr, Payload::Text(text.into()));
+    wait_for(|| !receiver.requests.lock().unwrap().is_empty());
+    {
+        let requests = receiver.requests.lock().unwrap();
+        let r = &requests[0];
+        assert_eq!(r.text.as_deref(), Some(text));
+        assert!(r.items.is_empty());
+        assert_eq!(r.peer_id, sender.id());
+        assert!(receiver.messages.lock().unwrap().is_empty());
+        r.decision
+            .send(Answer {
+                accept: false,
+                trust: false,
+            })
+            .unwrap();
+    }
+    let t = finish(&sender, id);
+    assert_eq!(t.stage, Stage::Declined, "{}", t.detail);
+    assert!(!h.join().unwrap());
+    assert!(receiver.messages.lock().unwrap().is_empty());
+    // Accepted with "trust": delivered, and the next one arrives directly.
+    let (addr, h) = one_server(receiver.clone());
+    let id = start(&sender, addr, Payload::Text(text.into()));
+    wait_for(|| !receiver.requests.lock().unwrap().is_empty());
+    receiver.requests.lock().unwrap()[0]
+        .decision
+        .send(Answer {
+            accept: true,
+            trust: true,
+        })
+        .unwrap();
+    assert_eq!(finish(&sender, id).stage, Stage::Done);
+    assert!(h.join().unwrap());
+    let (addr, h) = one_server(receiver.clone());
     let t = send_now(&sender, addr, Payload::Text(text.into()));
     assert_eq!(t.stage, Stage::Done, "{}", t.detail);
     assert!(h.join().unwrap());
     let messages = receiver.messages.lock().unwrap();
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].text, text);
     assert_eq!(messages[0].peer, "测试电脑");
+    drop(messages);
     assert!(!dest.exists());
     // Empty text never leaves the sender.
     let (addr, _h) = one_server(receiver.clone());
     let t = send_now(&sender, addr, Payload::Text("  \n ".into()));
     assert_eq!(t.stage, Stage::Failed);
+}
+
+#[test]
+fn receiver_failures_are_reported_to_the_sender() {
+    // A receiver that gives up mid-batch: the sender stops at once and shows
+    // the reason instead of a generic "connection lost".
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("big.bin");
+    let total = 64 * 1024 * 1024;
+    fs::write(&src, data(total)).unwrap();
+    let sender = shared(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = Identity::generate();
+    let server = thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        configure(&s, Duration::from_secs(10)).unwrap();
+        let me = About {
+            name: "满盘电脑".into(),
+            platform: Platform::Windows,
+        };
+        let (mut ch, _) = wire::accept(s, &identity, &me).unwrap();
+        let _offer: Offer = ch.recv_json(MAX_OFFER).unwrap();
+        ch.send_json(&Reply {
+            accept: true,
+            reason: String::new(),
+        })
+        .unwrap();
+        let mut got = ch.recv().unwrap().len();
+        got += ch.recv().unwrap().len();
+        report_failure(&mut ch, "磁盘空间不足".into());
+        // Whatever arrived before the sender noticed (the drain counts it).
+        got
+    });
+    let started = Instant::now();
+    let t = send_now(&sender, addr, files(&[&src]));
+    assert_eq!(t.stage, Stage::Failed);
+    assert!(t.detail.contains("磁盘空间不足"), "{}", t.detail);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let got = server.join().unwrap();
+    assert!(got < total, "the sender kept sending the whole file");
+    // The raw path too: a bad hash makes the receiver report it.
+    let dest = dir.path().join("recv");
+    let receiver = shared(&dest);
+    let (addr, h) = one_server(receiver.clone());
+    let mut ch = raw_client(addr, vec![file("f.bin", 4)]);
+    wait_for(|| !receiver.requests.lock().unwrap().is_empty());
+    receiver.requests.lock().unwrap()[0]
+        .decision
+        .send(Answer {
+            accept: true,
+            trust: false,
+        })
+        .unwrap();
+    let reply: Reply = ch.recv_json(4096).unwrap();
+    assert!(reply.accept);
+    ch.send(b"data").unwrap();
+    ch.send(&[0; 32]).unwrap();
+    let receipt: Receipt = ch.recv_json(4096).unwrap();
+    assert!(
+        !receipt.ok && receipt.reason.contains("校验"),
+        "{}",
+        receipt.reason
+    );
+    assert!(!h.join().unwrap());
+}
+
+#[test]
+fn batches_that_do_not_fit_on_the_disk_are_declined_for_trusted_senders() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("recv");
+    let Some(free) = free_space(dir.path()) else {
+        panic!("free space unknown");
+    };
+    assert!(free > 0);
+    // A sparse file larger than the free space (skipped when the disk is
+    // bigger than the largest file the protocol allows).
+    let size = free.saturating_add(10 * 1024 * 1024 * 1024);
+    if size > MAX_FILE {
+        return;
+    }
+    let src = dir.path().join("huge.bin");
+    File::create(&src).unwrap().set_len(size).unwrap();
+    let sender = shared(dir.path());
+    let receiver = trusting(&dest, &sender);
+    let (addr, h) = one_server(receiver.clone());
+    let t = send_now(&sender, addr, files(&[&src]));
+    assert_eq!(t.stage, Stage::Declined, "{}", t.detail);
+    assert!(t.detail.contains("磁盘空间"), "{}", t.detail);
+    assert!(!h.join().unwrap());
+    assert!(!dest.exists());
+    let r = receiver.transfers.lock().unwrap()[0].clone();
+    assert!(
+        r.stage == Stage::Failed && r.detail.contains("磁盘空间不足"),
+        "{}",
+        r.detail
+    );
 }
 
 #[test]

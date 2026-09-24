@@ -7,7 +7,7 @@ use std::sync::{
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIcon, TrayIconBuilder, TrayIconEvent,
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 pub fn make_tray(
@@ -45,12 +45,23 @@ pub fn make_tray(
     }));
     let s = shared.clone();
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+        // Windows: a left click opens the window, the right click the menu.
+        // macOS shows the menu on any click and sends no click events.
+        let click = matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } | TrayIconEvent::DoubleClick { .. }
+        );
+        if click {
             s.show();
         }
     }));
     let builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        .with_menu_on_left_click(cfg!(target_os = "macos"))
         .with_tooltip("邻传 · 局域网文件互传");
     // macOS menu-bar icons are monochrome "template" images that follow the
     // light / dark menu bar; Windows tray icons are shown in colour.

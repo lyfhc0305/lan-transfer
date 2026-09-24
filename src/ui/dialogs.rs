@@ -72,18 +72,21 @@ impl App {
                             .font(bold(16.))
                             .color(p.text),
                     );
-                    let what = match (request.items.len(), request.files) {
-                        (1, _) if !request.items[0].dir => "1 个文件".to_owned(),
-                        (_, files) => format!("{files} 个文件"),
+                    let what = match (&request.text, request.items.len(), request.files) {
+                        (Some(_), _, _) => "一段文字".to_owned(),
+                        (None, 1, _) if !request.items[0].dir => {
+                            format!("1 个文件（{}）", size(request.total))
+                        }
+                        (None, _, files) => format!("{files} 个文件（{}）", size(request.total)),
                     };
                     ui.label(
-                        RichText::new(format!("想发给你 {what}（{}）", size(request.total)))
+                        RichText::new(format!("想发给你 {what}"))
                             .font(body(13.))
                             .color(p.text_2),
                     );
                 });
                 ui.add_space(10.);
-                // What is coming.
+                // What is coming: the text, or every item (scrolling when long).
                 Frame::new()
                     .fill(p.bg)
                     .corner_radius(10)
@@ -91,39 +94,43 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.spacing_mut().item_spacing.y = 0.;
-                        let shown = request.items.len().min(4);
-                        for item in &request.items[..shown] {
-                            ui.horizontal(|ui| {
-                                ui.set_height(40.);
-                                let (r, _) = ui.allocate_exact_size(vec2(28., 28.), Sense::hover());
-                                widgets::file_tile(ui, r, &item.name, item.dir);
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let detail = if item.dir {
-                                        format!("{} 个文件 · {}", item.files, size(item.size))
-                                    } else {
-                                        size(item.size)
-                                    };
-                                    ui.label(RichText::new(detail).font(body(12.)).color(p.muted));
-                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                        widgets::truncated(
-                                            ui,
-                                            RichText::new(&item.name).font(body(13.)).color(p.text),
+                        // Shorter in a small window so the buttons stay visible.
+                        let list_height = (ctx.screen_rect().height() - 400.).clamp(90., 200.);
+                        egui::ScrollArea::vertical()
+                            .id_salt(("request", request.id))
+                            .max_height(list_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                if let Some(text) = &request.text {
+                                    ui.add_space(8.);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(text).font(body(13.5)).color(p.text),
                                         )
-                                        .on_hover_text(&item.name);
-                                    });
-                                });
+                                        .wrap()
+                                        .selectable(false),
+                                    );
+                                    ui.add_space(8.);
+                                }
+                                for item in &request.items {
+                                    request_item(ui, item);
+                                }
                             });
-                        }
-                        if request.items.len() > shown {
-                            ui.add_space(2.);
-                            ui.label(
-                                RichText::new(format!("还有 {} 项", request.items.len() - shown))
-                                    .font(body(12.))
-                                    .color(p.muted),
-                            );
-                            ui.add_space(6.);
-                        }
                     });
+                if let Some(free) = request.free.filter(|free| *free < request.total) {
+                    ui.add_space(8.);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "接收文件夹所在磁盘只剩 {}，不够保存这批文件。",
+                                size(free)
+                            ))
+                            .font(body(12.))
+                            .color(p.danger),
+                        )
+                        .wrap(),
+                    );
+                }
                 ui.add_space(12.);
                 widgets::checkbox(ui, &mut self.trust_choice.1, "信任此设备，以后自动接收");
                 ui.add_space(4.);
@@ -246,7 +253,6 @@ impl App {
                         {
                             ui.ctx().copy_text(message.text.clone());
                             self.notify(Tone::Success, "已复制到剪贴板。");
-                            done = true;
                         }
                         if let Some(link) = &link {
                             if Button::secondary("打开链接")
@@ -423,6 +429,28 @@ impl App {
             self.address_dialog.open = false;
         }
     }
+}
+
+/// One row of the request dialog's list.
+fn request_item(ui: &mut Ui, item: &ItemSummary) {
+    let p = pal(ui);
+    ui.horizontal(|ui| {
+        ui.set_height(40.);
+        let (r, _) = ui.allocate_exact_size(vec2(28., 28.), Sense::hover());
+        widgets::file_tile(ui, r, &item.name, item.dir);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let detail = if item.dir {
+                format!("{} 个文件 · {}", item.files, size(item.size))
+            } else {
+                size(item.size)
+            };
+            ui.label(RichText::new(detail).font(body(12.)).color(p.muted));
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                widgets::truncated(ui, RichText::new(&item.name).font(body(13.)).color(p.text))
+                    .on_hover_text(&item.name);
+            });
+        });
+    });
 }
 
 #[cfg(test)]

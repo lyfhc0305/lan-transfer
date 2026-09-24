@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -122,7 +122,7 @@ pub fn describe(e: &(dyn std::error::Error + 'static)) -> String {
 // ───────────────────────────── names and paths ─────────────────────────────
 
 /// A single path component that is safe to create on macOS and Windows.
-fn safe_name(name: &str) -> bool {
+pub(crate) fn safe_name(name: &str) -> bool {
     if name.is_empty()
         || name.len() > 180
         || name == "."
@@ -568,6 +568,7 @@ impl<'a> Progress<'a> {
             t.files_done = files;
             t.rate = rate;
             t.current = current;
+            t.updated = Instant::now();
         });
     }
 }
@@ -663,7 +664,7 @@ fn handle(stream: TcpStream, shared: &Arc<Shared>) -> Result<()> {
         return Ok(());
     }
     match offer {
-        Offer::Text { text } => receive_text(ch, shared, &remote, ip, text),
+        Offer::Text { text } => receive_text(ch, shared, &remote, ip, text, trusted),
         Offer::Files { entries } => {
             receive_files(ch, shared, &remote, ip, entries, trusted, &settings.folder)
         }
@@ -676,6 +677,7 @@ fn receive_text(
     remote: &Remote,
     ip: IpAddr,
     text: String,
+    trusted: bool,
 ) -> Result<()> {
     if text.trim().is_empty() || text.len() > MAX_TEXT {
         ch.send_json(&Reply {
@@ -684,23 +686,100 @@ fn receive_text(
         })?;
         return Err(fail("文字为空或过长"));
     }
-    ch.send_json(&Reply {
-        accept: true,
-        reason: String::new(),
-    })?;
     let mut t = Transfer::new(false, &remote.about.name, ip.to_string());
     t.text = Some(text.clone());
     t.total = text.len() as u64;
-    t.done = t.total;
-    t.stage = Stage::Done;
-    let (id, _) = shared.add(t);
-    shared.messages.lock().unwrap().push(Message {
-        id,
-        peer: remote.about.name.clone(),
-        text,
+    t.stage = Stage::Waiting;
+    let (id, cancel) = shared.add(t);
+    let _watch = watch_cancel(ch.stream(), &cancel)?;
+    let outcome = (|| -> Result<()> {
+        // Text from an unknown device is confirmed like files are, so nobody
+        // on the network can pop up messages or links unasked.
+        if !trusted {
+            let request = Request {
+                id,
+                peer: remote.about.name.clone(),
+                peer_id: remote.id.clone(),
+                platform: remote.about.platform,
+                address: ip.to_string(),
+                text: Some(text.clone()),
+                items: vec![],
+                files: 0,
+                total: text.len() as u64,
+                free: None,
+                created: Instant::now(),
+                decision: mpsc::sync_channel(1).0,
+            };
+            ask_user(shared, &mut ch, remote, ip, request)?;
+        }
+        cancelled(&cancel)?;
+        ch.send_json(&Reply {
+            accept: true,
+            reason: String::new(),
+        })?;
+        Ok(())
+    })();
+    shared.update(id, |t| {
+        conclude(t, &outcome, &cancel);
     });
+    if outcome.is_ok() {
+        shared.messages.lock().unwrap().push(Message {
+            id,
+            peer: remote.about.name.clone(),
+            text,
+        });
+        shared.show();
+    }
+    outcome
+}
+
+/// Show an unknown device's request to the user and wait for the answer.
+/// Returns once accepted; declining, timing out and the sender leaving end
+/// the transfer with the matching [`Ended`] error. `request.decision` is
+/// replaced with a fresh channel.
+fn ask_user(
+    shared: &Shared,
+    ch: &mut Secure,
+    remote: &Remote,
+    ip: IpAddr,
+    mut request: Request,
+) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    request.decision = tx;
+    let id = request.id;
+    shared.requests.lock().unwrap().push(request);
     shared.show();
-    Ok(())
+    let decision = await_decision(ch.stream(), &rx);
+    shared.requests.lock().unwrap().retain(|r| r.id != id);
+    shared.wake();
+    match decision {
+        Decision::Accepted { trust: true } => {
+            trust(
+                shared,
+                &remote.id,
+                &remote.about.name,
+                remote.about.platform,
+                &ip.to_string(),
+            );
+            Ok(())
+        }
+        Decision::Accepted { trust: false } => Ok(()),
+        Decision::SenderLeft => Err(ended(Stage::Cancelled, "对方已取消发送")),
+        Decision::Rejected => {
+            let _ = ch.send_json(&Reply {
+                accept: false,
+                reason: "对方拒绝了接收".into(),
+            });
+            Err(ended(Stage::Declined, "已拒绝"))
+        }
+        Decision::TimedOut => {
+            let _ = ch.send_json(&Reply {
+                accept: false,
+                reason: "对方没有在两分钟内确认".into(),
+            });
+            Err(ended(Stage::Declined, "超时未确认，已自动拒绝"))
+        }
+    }
 }
 
 fn receive_files(
@@ -729,50 +808,38 @@ fn receive_files(
     let (id, cancel) = shared.add(t);
     let _watch = watch_cancel(ch.stream(), &cancel)?;
     let mut saved = vec![];
+    // Set once the batch was accepted: from then on failures are reported
+    // to the sender with a receipt instead of a plain disconnect.
+    let mut accepted = false;
     let outcome = (|| -> Result<()> {
+        let free = free_space(folder);
         if !trusted {
-            let (tx, rx) = mpsc::sync_channel(1);
-            shared.requests.lock().unwrap().push(Request {
+            let request = Request {
                 id,
                 peer: remote.about.name.clone(),
                 peer_id: remote.id.clone(),
                 platform: remote.about.platform,
                 address: ip.to_string(),
+                text: None,
                 items,
                 files,
                 total,
+                free,
                 created: Instant::now(),
-                decision: tx,
+                decision: mpsc::sync_channel(1).0,
+            };
+            ask_user(shared, &mut ch, remote, ip, request)?;
+        } else if free.is_some_and(|free| free < total) {
+            // Nobody is asked, so do not start a batch that cannot fit.
+            let _ = ch.send_json(&Reply {
+                accept: false,
+                reason: "对方的磁盘空间不足".into(),
             });
-            shared.show();
-            let decision = await_decision(ch.stream(), &rx);
-            shared.requests.lock().unwrap().retain(|r| r.id != id);
-            shared.wake();
-            match decision {
-                Decision::Accepted { trust: true } => trust(
-                    shared,
-                    &remote.id,
-                    &remote.about.name,
-                    remote.about.platform,
-                    &ip.to_string(),
-                ),
-                Decision::Accepted { trust: false } => {}
-                Decision::SenderLeft => return Err(ended(Stage::Cancelled, "对方已取消发送")),
-                Decision::Rejected => {
-                    let _ = ch.send_json(&Reply {
-                        accept: false,
-                        reason: "对方拒绝了接收".into(),
-                    });
-                    return Err(ended(Stage::Declined, "已拒绝"));
-                }
-                Decision::TimedOut => {
-                    let _ = ch.send_json(&Reply {
-                        accept: false,
-                        reason: "对方没有在两分钟内确认".into(),
-                    });
-                    return Err(ended(Stage::Declined, "超时未确认，已自动拒绝"));
-                }
-            }
+            return Err(fail(format!(
+                "磁盘空间不足：这批文件需要 {}，接收文件夹所在磁盘只剩 {}",
+                size(total),
+                size(free.unwrap_or(0))
+            )));
         }
         cancelled(&cancel)?;
         if let Err(e) = fs::create_dir_all(folder) {
@@ -786,6 +853,7 @@ fn receive_files(
             accept: true,
             reason: String::new(),
         })?;
+        accepted = true;
         shared.update(id, |t| t.stage = Stage::Running);
         configure(ch.stream(), Duration::from_secs(30))?;
         receive_entries(&mut ch, shared, id, &cancel, folder, &entries, &mut saved)?;
@@ -795,6 +863,11 @@ fn receive_files(
         })?;
         Ok(())
     })();
+    if let Err(e) = &outcome {
+        if accepted && !e.is::<Ended>() && !cancel.load(Ordering::Relaxed) {
+            report_failure(&mut ch, describe(e.as_ref()));
+        }
+    }
     shared.update(id, |t| {
         t.saved = saved.clone();
         conclude(t, &outcome, &cancel);
@@ -810,6 +883,94 @@ fn receive_files(
         Err(_) => {}
     }
     outcome
+}
+
+/// Tell the sender why receiving failed. The sender stops as soon as it sees
+/// the receipt; keep reading what it has already sent until it closes, so
+/// the connection is not reset with the receipt still unread.
+fn report_failure(ch: &mut Secure, reason: String) {
+    let _ = ch.send_json(&Receipt { ok: false, reason });
+    let Ok(mut s) = ch.stream().try_clone() else {
+        return;
+    };
+    let _ = s.shutdown(Shutdown::Write);
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut sink = vec![0; 65536];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        match s.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Free space on the disk holding `path` (or its nearest existing parent).
+pub fn free_space(path: &Path) -> Option<u64> {
+    let mut p = path;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    disk::free_space(p)
+}
+
+#[cfg(unix)]
+mod disk {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+
+    pub fn free_space(p: &Path) -> Option<u64> {
+        let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+        #[cfg(target_os = "macos")]
+        {
+            // statfs has 64-bit block counts on macOS; statvfs does not.
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: plain libc call with a valid C string and an out pointer.
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+                return None;
+            }
+            Some(st.f_bavail * st.f_bsize as u64)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: plain libc call with a valid C string and an out pointer.
+            if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+                return None;
+            }
+            // The field types vary by platform (u32 on some), hence the casts.
+            #[allow(clippy::unnecessary_cast)]
+            Some(st.f_bavail as u64 * st.f_frsize as u64)
+        }
+    }
+}
+
+#[cfg(windows)]
+mod disk {
+    use std::{os::windows::ffi::OsStrExt, path::Path};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            free: *mut u64,
+        ) -> i32;
+    }
+
+    pub fn free_space(p: &Path) -> Option<u64> {
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        // SAFETY: a NUL-terminated wide string and three valid out pointers.
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+        (ok != 0).then_some(avail)
+    }
 }
 
 fn receive_entries(
@@ -1058,7 +1219,11 @@ fn send_batch(
     shared.update(id, |t| t.stage = Stage::Running);
     let mut progress = Progress::new(shared, id);
     let mut buf = vec![0; CHUNK];
-    for s in sources.iter().filter(|s| !s.entry.dir) {
+    // The receiver only writes back early to report a failure; stop sending
+    // as soon as it does instead of pushing the rest of the batch.
+    let early = watch_early_reply(ch.stream())?;
+    let mut interrupted = None;
+    'files: for s in sources.iter().filter(|s| !s.entry.dir) {
         cancelled(cancel)?;
         progress.file(&s.entry.path);
         let changed = || {
@@ -1075,43 +1240,131 @@ fn send_batch(
         let mut left = s.entry.size;
         while left > 0 {
             cancelled(cancel)?;
+            if early.triggered() {
+                interrupted = Some(fail("连接已断开：对方可能已取消，或网络中断"));
+                break 'files;
+            }
             let want = (left as usize).min(CHUNK);
             let n = file.read(&mut buf[..want])?;
             if n == 0 {
                 return Err(changed());
             }
-            ch.send(&buf[..n])?;
+            if let Err(e) = ch.send(&buf[..n]) {
+                interrupted = Some(e);
+                break 'files;
+            }
             hash.update(&buf[..n]);
             left -= n as u64;
             progress.add(n);
         }
-        ch.send(&hash.finalize())?;
+        if let Err(e) = ch.send(&hash.finalize()) {
+            interrupted = Some(e);
+            break 'files;
+        }
         progress.file_done();
     }
+    drop(early);
     progress.publish();
-    // The receiver answers after saving the last file.
+    cancelled(cancel)?;
+    // The receiver answers after saving the last file, or right away with
+    // the reason when it gave up.
+    let wait = if interrupted.is_some() { 3 } else { 120 };
     ch.stream()
-        .set_read_timeout(Some(Duration::from_secs(120)))?;
-    let receipt: Receipt = ch.recv_json(64 * 1024)?;
-    if !receipt.ok {
-        return Err(fail(wire::clean_name(&receipt.reason)));
+        .set_read_timeout(Some(Duration::from_secs(wait)))?;
+    match (ch.recv_json::<Receipt>(64 * 1024), interrupted) {
+        (Ok(receipt), _) if receipt.ok => Ok(()),
+        (Ok(receipt), _) => {
+            let reason = wire::clean_name(&receipt.reason);
+            Err(fail(format!("对方无法保存：{reason}")))
+        }
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(e),
     }
-    Ok(())
 }
 
-/// IPv4 addresses of this computer, private networks first.
+/// Flag set by a thread as soon as the other side sends anything (or closes)
+/// while this side is only sending.
+struct EarlyReply {
+    triggered: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl EarlyReply {
+    fn triggered(&self) -> bool {
+        self.triggered.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for EarlyReply {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn watch_early_reply(stream: &TcpStream) -> io::Result<EarlyReply> {
+    let watched = stream.try_clone()?;
+    // Nothing else reads during the data phase, so a short read timeout on
+    // the shared socket is safe here; it is set again before the receipt.
+    watched.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let triggered = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (t, s) = (triggered.clone(), stop.clone());
+    std::thread::spawn(move || {
+        while !s.load(Ordering::Relaxed) {
+            match watched.peek(&mut [0; 1]) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                _ => {
+                    t.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+    Ok(EarlyReply { triggered, stop })
+}
+
+/// IPv4 addresses of this computer: Wi-Fi and Ethernet first, then private
+/// networks, with virtual adapters (Docker, VPN, virtual machines) last.
 pub fn local_addresses() -> Vec<Ipv4Addr> {
-    let mut list: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+    let mut list: Vec<(bool, bool, Ipv4Addr)> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|x| match x.addr {
-            if_addrs::IfAddr::V4(v) if !v.ip.is_loopback() && !v.ip.is_link_local() => Some(v.ip),
+            if_addrs::IfAddr::V4(v) if !v.ip.is_loopback() && !v.ip.is_link_local() => {
+                Some((virtual_adapter(&x.name), !v.ip.is_private(), v.ip))
+            }
             _ => None,
         })
         .collect();
-    list.sort_by_key(|ip| (!ip.is_private(), *ip));
+    list.sort();
+    let mut list: Vec<Ipv4Addr> = list.into_iter().map(|(_, _, ip)| ip).collect();
     list.dedup();
     list
+}
+
+/// Interface names of container bridges, VPN tunnels and virtual machines.
+fn virtual_adapter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    const PREFIXES: [&str; 17] = [
+        "docker", "veth", "br-", "virbr", "utun", "tun", "tap", "ppp", "vmnet", "vboxnet", "zt",
+        "wg", "bridge", "awdl", "llw", "gif", "stf",
+    ];
+    const WORDS: [&str; 9] = [
+        "docker",
+        "vethernet",
+        "virtualbox",
+        "vmware",
+        "hyper-v",
+        "wsl",
+        "tailscale",
+        "zerotier",
+        "vpn",
+    ];
+    PREFIXES.iter().any(|v| name.starts_with(v)) || WORDS.iter().any(|v| name.contains(v))
 }
 
 pub fn parse_address(text: &str) -> std::result::Result<SocketAddr, String> {

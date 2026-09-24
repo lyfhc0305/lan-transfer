@@ -119,7 +119,7 @@ pub fn app(ctx: &Context, shared: Arc<Shared>, quit: Arc<AtomicBool>) -> Option<
             shared.add(t);
         }
         "settings" => app.page = Page::Settings,
-        "request" => {
+        "request" | "request-space" => {
             let (tx, rx) = mpsc::sync_channel(1);
             std::mem::forget(rx);
             shared.requests.lock().unwrap().push(Request {
@@ -128,7 +128,26 @@ pub fn app(ctx: &Context, shared: Arc<Shared>, quit: Arc<AtomicBool>) -> Option<
                 peer_id: "01".repeat(32),
                 platform: Platform::Windows,
                 address: "192.168.1.40".into(),
+                text: None,
                 items: vec![
+                    ItemSummary {
+                        name: "发票 2026-09.pdf".into(),
+                        dir: false,
+                        size: 410_000,
+                        files: 1,
+                    },
+                    ItemSummary {
+                        name: "报价单.xlsx".into(),
+                        dir: false,
+                        size: 96_000,
+                        files: 1,
+                    },
+                    ItemSummary {
+                        name: "宣传视频.mov".into(),
+                        dir: false,
+                        size: 812_000_000,
+                        files: 1,
+                    },
                     ItemSummary {
                         name: "季度报告 2026.pdf".into(),
                         dir: false,
@@ -148,8 +167,31 @@ pub fn app(ctx: &Context, shared: Arc<Shared>, quit: Arc<AtomicBool>) -> Option<
                         files: 1,
                     },
                 ],
-                files: 130,
-                total: 1_122_394_000,
+                files: 133,
+                total: 1_934_900_000,
+                free: if scene == "request-space" {
+                    Some(1_200_000_000)
+                } else {
+                    None
+                },
+                created: Instant::now(),
+                decision: tx,
+            });
+        }
+        "request-text" => {
+            let (tx, rx) = mpsc::sync_channel(1);
+            std::mem::forget(rx);
+            shared.requests.lock().unwrap().push(Request {
+                id: 2,
+                peer: "DESKTOP-7F3K2L".into(),
+                peer_id: "03".repeat(32),
+                platform: Platform::Windows,
+                address: "192.168.1.63".into(),
+                text: Some("明天的会议链接：https://meeting.example.com/j/8842\n密码 2026".into()),
+                items: vec![],
+                files: 0,
+                total: 0,
+                free: None,
                 created: Instant::now(),
                 decision: tx,
             });

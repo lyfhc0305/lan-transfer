@@ -231,14 +231,12 @@ impl App {
     }
 }
 
-/// "/Users/demo/Downloads/邻传接收" → "~/Downloads/邻传接收".
+/// "/Users/demo/Downloads/邻传接收" → "~/Downloads/邻传接收";
+/// "C:\\Users\\demo\\Downloads\\邻传接收" → "…\\Downloads\\邻传接收".
 fn short_path(path: &str) -> String {
-    if cfg!(windows) {
-        return path.to_owned();
-    }
     if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().display().to_string()) {
         if let Some(rest) = path.strip_prefix(&home) {
-            return format!("~{rest}");
+            return format!("{}{rest}", if cfg!(windows) { "…" } else { "~" });
         }
     }
     path.to_owned()

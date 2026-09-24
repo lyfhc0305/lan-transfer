@@ -82,6 +82,9 @@ pub struct Settings {
     pub trusted_only: bool,
     pub close_to_tray: bool,
     pub trusted: Vec<TrustedDevice>,
+    /// The one-time notice that closing the window keeps the app running
+    /// has been shown.
+    pub tray_hint_shown: bool,
 }
 
 impl Default for Settings {
@@ -97,6 +100,7 @@ impl Default for Settings {
             trusted_only: false,
             close_to_tray: true,
             trusted: vec![],
+            tray_hint_shown: false,
         }
     }
 }
@@ -301,8 +305,10 @@ pub struct Transfer {
     pub files_done: usize,
     /// File currently being transferred.
     pub current: String,
-    /// Bytes per second, smoothed.
+    /// Bytes per second, smoothed; see [`Transfer::speed`].
     pub rate: f64,
+    /// When progress was last reported, so a stalled transfer shows no speed.
+    pub updated: Instant,
     pub stage: Stage,
     /// Failure reason or other note.
     pub detail: String,
@@ -331,6 +337,7 @@ impl Transfer {
             files_done: 0,
             current: String::new(),
             rate: 0.,
+            updated: Instant::now(),
             stage: Stage::Connecting,
             detail: String::new(),
             saved: vec![],
@@ -374,11 +381,20 @@ impl Transfer {
             (self.done as f64 / self.total as f64).clamp(0., 1.) as f32
         }
     }
+    /// Current speed in bytes per second; 0 once no data has arrived for
+    /// a couple of seconds.
+    pub fn speed(&self) -> f64 {
+        if self.stage == Stage::Running && self.updated.elapsed() < Duration::from_secs(2) {
+            self.rate
+        } else {
+            0.
+        }
+    }
     /// Remaining time at the current speed.
     pub fn eta(&self) -> Option<Duration> {
-        (self.stage == Stage::Running && self.rate > 1.).then(|| {
-            Duration::from_secs_f64(self.total.saturating_sub(self.done) as f64 / self.rate)
-        })
+        let speed = self.speed();
+        (speed > 1.)
+            .then(|| Duration::from_secs_f64(self.total.saturating_sub(self.done) as f64 / speed))
     }
 }
 
@@ -398,7 +414,7 @@ pub struct Answer {
     pub trust: bool,
 }
 
-/// An incoming batch waiting for the user to accept it.
+/// An incoming batch (or text) waiting for the user to accept it.
 #[derive(Clone)]
 pub struct Request {
     /// Same as the matching [`Transfer::id`].
@@ -407,9 +423,13 @@ pub struct Request {
     pub peer_id: String,
     pub platform: Platform,
     pub address: String,
+    /// Set for a text message; `items` is then empty.
+    pub text: Option<String>,
     pub items: Vec<ItemSummary>,
     pub files: usize,
     pub total: u64,
+    /// Free space on the receive folder's disk, when known.
+    pub free: Option<u64>,
     pub created: Instant,
     pub decision: SyncSender<Answer>,
 }
@@ -500,8 +520,36 @@ impl Shared {
         self.wake();
     }
     pub fn event(&self, e: Event) {
+        // The interface may not be drawn at all while the window is hidden
+        // (Windows sends no paint messages), so tell the system instead.
+        if !self.visible.load(std::sync::atomic::Ordering::Relaxed) {
+            self.notify_hidden(&e);
+        }
         self.events.lock().unwrap().push(e);
         self.wake();
+    }
+    fn notify_hidden(&self, e: &Event) {
+        let (title, body) = match e {
+            Event::Received { id } => {
+                let Some(t) = self.transfer(*id) else { return };
+                ("已收到文件", format!("「{}」发来 {}", t.peer, t.title()))
+            }
+            Event::Sent { id } => {
+                let Some(t) = self.transfer(*id) else { return };
+                ("已发送", format!("{} 已发送给「{}」", t.title(), t.peer))
+            }
+            Event::Failed { id } => {
+                let Some(t) = self.transfer(*id) else { return };
+                let what = if t.outgoing {
+                    "发送失败"
+                } else {
+                    "接收失败"
+                };
+                (what, format!("{}：{}", t.title(), t.detail))
+            }
+            Event::Note(text) => ("邻传", text.clone()),
+        };
+        crate::notify::system(title, &body);
     }
     pub fn add(&self, t: Transfer) -> (u64, Arc<AtomicBool>) {
         let (id, cancel) = (t.id, t.cancel.clone());

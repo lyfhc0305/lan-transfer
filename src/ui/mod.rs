@@ -132,6 +132,8 @@ pub struct App {
     addresses: Vec<Ipv4Addr>,
     addresses_at: Option<Instant>,
     content_top: f32,
+    /// Bottom of the page area (above the send bar), where toasts sit.
+    content_bottom: f32,
 }
 
 impl App {
@@ -162,6 +164,7 @@ impl App {
             addresses: vec![],
             addresses_at: None,
             content_top: 64.,
+            content_bottom: 600.,
         };
         if let Some(w) = warning {
             app.notify(Tone::Error, w);
@@ -195,6 +198,7 @@ impl App {
 
     pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
         let mut over = false;
+        let mut unreadable = vec![];
         for path in paths {
             if self.picked.iter().any(|f| f.path == path) {
                 continue;
@@ -203,13 +207,14 @@ impl App {
                 over = true;
                 break;
             }
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
+            let Ok(meta) = std::fs::metadata(&path) else {
+                unreadable.push(name);
+                continue;
+            };
             let dir = meta.is_dir();
             let (size, counting) = if dir {
                 (
@@ -232,6 +237,19 @@ impl App {
                 Tone::Info,
                 format!("一次最多选择 {MAX_PICKED} 项，可以把文件放进文件夹后整体发送。"),
             );
+        } else if !unreadable.is_empty() {
+            self.notify(
+                Tone::Error,
+                format!(
+                    "无法读取「{}」{}，已跳过。",
+                    ellipsize(&unreadable[0], 30),
+                    if unreadable.len() > 1 {
+                        format!(" 等 {} 项", unreadable.len())
+                    } else {
+                        String::new()
+                    }
+                ),
+            );
         }
     }
 
@@ -253,6 +271,15 @@ impl App {
     fn hide(&mut self, ctx: &Context) {
         self.shared.visible.store(false, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Say once that closing the window did not quit.
+        let first = !self.shared.settings.lock().unwrap().tray_hint_shown;
+        if first {
+            self.change_settings(|s| s.tray_hint_shown = true);
+            crate::notify::system(
+                "邻传仍在运行",
+                &format!("已收起到{TRAY_PLACE}，仍可接收文件。从图标菜单可以重新打开或退出。"),
+            );
+        }
     }
 
     fn local_addresses(&mut self) -> Vec<Ipv4Addr> {
@@ -409,7 +436,7 @@ impl App {
         } else if !ready {
             ("正在启动", p.muted, "正在启动接收服务…".to_owned())
         } else if let Some(note) = discovery_note {
-            ("可接收", p.warning, note)
+            ("不可被发现", p.warning, note)
         } else if settings.trusted_only {
             (
                 "仅接收信任设备",
@@ -464,9 +491,11 @@ impl App {
         let width = (ctx.screen_rect().width() - 2. * PAD).min(420.);
         let mut close = false;
         let mut run = None;
+        // Above the send bar, where nothing needs to be clicked.
+        let lift = ctx.screen_rect().bottom() - self.content_bottom + 10.;
         egui::Area::new(Id::new("toast"))
             .order(Order::Foreground)
-            .anchor(Align2::CENTER_TOP, vec2(0., self.content_top + 8.))
+            .anchor(Align2::CENTER_BOTTOM, vec2(0., -lift))
             .interactable(true)
             .show(ctx, |ui| {
                 Frame::new()
@@ -631,7 +660,8 @@ fn count_folder(path: PathBuf, ctx: Context) -> mpsc::Receiver<(u64, usize)> {
                 let Ok(kind) = e.file_type() else {
                     continue;
                 };
-                if network::is_junk(&e.file_name().to_string_lossy()) {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if network::is_junk(&name) || !network::safe_name(&name) {
                     continue;
                 }
                 if kind.is_dir() {
@@ -777,6 +807,7 @@ impl App {
             .frame(Frame::new().fill(p.bg))
             .show(ctx, |ui| {
                 self.content_top = ui.max_rect().top();
+                self.content_bottom = ui.max_rect().bottom();
                 egui::ScrollArea::vertical()
                     .id_salt(("page", self.page as u8))
                     .auto_shrink([false, false])
@@ -902,6 +933,7 @@ mod tests {
             peer_id: "a".repeat(64),
             platform: Platform::Windows,
             address: "192.168.1.40".into(),
+            text: None,
             items: vec![ItemSummary {
                 name: "合同.pdf".into(),
                 dir: false,
@@ -910,6 +942,7 @@ mod tests {
             }],
             files: 1,
             total: 2048,
+            free: Some(1024),
             created: Instant::now(),
             decision: tx,
         });

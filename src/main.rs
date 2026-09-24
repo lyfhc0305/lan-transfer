@@ -2,6 +2,7 @@
 mod discovery;
 mod model;
 mod network;
+mod notify;
 mod ui;
 mod wire;
 use eframe::egui;
