@@ -34,7 +34,10 @@ pub fn make_tray(
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         #[cfg(target_os = "macos")]
         if let Some(&key) = app_menu.edit.get(&event.id) {
-            if let Some(e) = super::widgets::edit_event(key) {
+            // Paste may be files, which only the app can add.
+            if key == egui::Key::V {
+                s.event(crate::model::Event::Paste);
+            } else if let Some(e) = super::widgets::edit_event(key) {
                 super::widgets::queue_edit_command(&s.ctx, None, e);
             }
             return;
