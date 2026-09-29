@@ -4,9 +4,11 @@ use super::icons::{self, Icon};
 use super::theme::{body, bold, pal, Palette};
 use crate::model::Platform;
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame,
-    Galley, Id, Margin, Pos2, Rect, Response, RichText, Sense, Shadow, Shape, Stroke, StrokeKind,
-    TextFormat, TextWrapMode, Ui, WidgetInfo, WidgetType,
+    self, pos2,
+    text::{CCursorRange, LayoutJob},
+    vec2, Align2, Color32, CornerRadius, CursorIcon, Event, FontId, Frame, Galley, Id, Key,
+    KeyboardShortcut, Margin, Modifiers, PointerButton, Pos2, Rect, Response, RichText, Sense,
+    Shadow, Shape, Stroke, StrokeKind, TextFormat, TextWrapMode, Ui, WidgetInfo, WidgetType,
 };
 use std::sync::Arc;
 
@@ -769,4 +771,124 @@ pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str, danger: bool) -> Response
         fg,
     );
     response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Right-click menu for a text field: cut, copy, paste and select all.
+/// ⌘/Ctrl+X, C, V and A already work through egui; each item sends the same
+/// command to the field on the next frame (see `run_edit_command`), so the
+/// selection, undo and `char_limit` behave exactly as with the keyboard.
+pub fn edit_menu(response: &Response, text: &str) {
+    let ctx = &response.ctx;
+    let id = response.id;
+    let saved = id.with("edit-menu-selection");
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    // egui moves the cursor to the pointer on any press, which would drop the
+    // selection a right-click is meant to act on: put it back.
+    if response.hovered() && ctx.input(|i| i.pointer.button_pressed(PointerButton::Secondary)) {
+        if let Some(range) = ctx
+            .data(|d| d.get_temp::<Option<CCursorRange>>(saved))
+            .flatten()
+        {
+            state.cursor.set_char_range(Some(range));
+            state.clone().store(ctx, id);
+        }
+    }
+    let range = state.cursor.char_range();
+    ctx.data_mut(|d| d.insert_temp(saved, range));
+    let selected = range.is_some_and(|r| r.primary.index != r.secondary.index);
+    response.context_menu(|ui| {
+        ui.set_min_width(180.);
+        let mut command = None;
+        if shortcut_item(ui, "剪切", Key::X, selected).clicked() {
+            command = Some(Event::Cut);
+        }
+        if shortcut_item(ui, "复制", Key::C, selected).clicked() {
+            command = Some(Event::Copy);
+        }
+        if shortcut_item(ui, "粘贴", Key::V, true).clicked() {
+            // egui cannot read the clipboard itself; the keyboard shortcut
+            // gets the text from egui-winit, the menu from arboard.
+            let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
+            command = pasted.ok().map(|t| Event::Paste(t.replace("\r\n", "\n")));
+        }
+        ui.add_space(2.);
+        separator(ui);
+        ui.add_space(2.);
+        if shortcut_item(ui, "全选", Key::A, !text.is_empty()).clicked() {
+            command = Some(Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            });
+        }
+        if let Some(event) = command {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(Id::new(EDIT_COMMAND), Some((id, event))));
+            ui.ctx().request_repaint();
+            ui.close_menu();
+        }
+    });
+}
+
+const EDIT_COMMAND: &str = "edit-menu-command";
+
+/// Hands the command picked in an `edit_menu` to its field, as if typed.
+/// Called at the start of the frame, before any text field is shown.
+pub fn run_edit_command(ctx: &egui::Context) {
+    let key = Id::new(EDIT_COMMAND);
+    let Some((field, event)) = ctx
+        .data_mut(|d| d.remove_temp::<Option<(Id, Event)>>(key))
+        .flatten()
+    else {
+        return;
+    };
+    ctx.memory_mut(|m| m.request_focus(field));
+    ctx.input_mut(|i| i.events.push(event));
+}
+
+/// Edit menu row: label on the left, keyboard shortcut on the right.
+fn shortcut_item(ui: &mut Ui, label: &str, key: Key, enabled: bool) -> Response {
+    let p = pal(ui);
+    let shortcut = ui
+        .ctx()
+        .format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key));
+    let width = ui.available_width().max(180.);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 30.), sense);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    let hovered = enabled && response.hovered();
+    let (fg, hint) = match (enabled, hovered) {
+        (false, _) => (p.muted, p.muted),
+        (true, true) => (p.on_accent, p.on_accent),
+        (true, false) => (p.text, p.muted),
+    };
+    if hovered {
+        ui.painter().rect_filled(rect, 6, p.accent);
+    }
+    let y = rect.center().y;
+    ui.painter().text(
+        pos2(rect.left() + 12., y),
+        Align2::LEFT_CENTER,
+        label,
+        body(13.),
+        fg,
+    );
+    ui.painter().text(
+        pos2(rect.right() - 12., y),
+        Align2::RIGHT_CENTER,
+        shortcut,
+        body(12.),
+        hint,
+    );
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }

@@ -371,6 +371,7 @@ impl App {
                         .margin(Margin::symmetric(10, 8))
                         .desired_width(f32::INFINITY),
                 );
+                widgets::edit_menu(&edit, &self.address_dialog.input);
                 if self.address_dialog.focus {
                     edit.request_focus();
                     self.address_dialog.focus = false;

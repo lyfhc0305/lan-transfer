@@ -723,6 +723,7 @@ impl App {
             }
         }
         self.shortcuts(ctx);
+        widgets::run_edit_command(ctx);
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
