@@ -1,8 +1,14 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod autostart;
 mod discovery;
 mod model;
 mod network;
+mod notify;
+#[cfg(windows)]
+mod registry;
+mod resume;
 mod ui;
+mod update;
 mod wire;
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -17,6 +23,8 @@ use std::{
 };
 
 fn main() {
+    // Started with the computer: stay in the menu bar / tray.
+    let hidden = std::env::args().any(|a| a == autostart::HIDDEN_ARG);
     let instance = match TcpListener::bind("127.0.0.1:45874") {
         Ok(listener) => listener,
         Err(_) => {
@@ -75,6 +83,7 @@ fn main() {
         Box::new(move |cc| {
             ui::configure(&cc.egui_ctx);
             let (settings, warning) = model::load_settings();
+            let launch_at_login = settings.launch_at_login;
             let shared = model::Shared::new(settings, cc.egui_ctx.clone());
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(h) = handle.as_raw() {
@@ -96,6 +105,11 @@ fn main() {
             if let Some(app) = ui::demo::app(&cc.egui_ctx, shared.clone(), quit.clone()) {
                 return Ok(Box::new(app));
             }
+            shared.load_history();
+            if launch_at_login {
+                // Follow the app if it was moved since the entry was made.
+                let _ = autostart::set(true);
+            }
             let tray = ui::make_tray(shared.clone(), quit.clone());
             let tray_error = tray
                 .as_ref()
@@ -113,8 +127,13 @@ fn main() {
                 });
             network::start_receiver(shared.clone());
             discovery::start(shared.clone());
+            update::start(shared.clone());
             #[allow(unused_mut)]
+            let has_tray = tray.is_ok();
             let mut app = ui::App::new(shared, quit, tray.ok(), warning.or(tray_error));
+            if hidden && has_tray {
+                app.start_hidden();
+            }
             // End-to-end tests: files to pick at start, as if dropped.
             #[cfg(feature = "demo")]
             if let Ok(paths) = std::env::var("LAN_TRANSFER_PICK") {

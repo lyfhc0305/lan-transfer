@@ -383,6 +383,69 @@ fn receiver_cancel_stops_the_sender_and_removes_partial_files() {
 }
 
 #[test]
+fn a_batch_that_broke_off_continues_where_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("recv");
+    let (small, big) = (dir.path().join("a.txt"), dir.path().join("big.bin"));
+    fs::write(&small, b"hello").unwrap();
+    fs::write(&big, data(64 * 1024 * 1024)).unwrap();
+    let sender = shared(dir.path());
+    let receiver = trusting(&dest, &sender);
+    let (addr, h) = one_server(receiver.clone());
+    // The sender goes away in the middle of the big file.
+    let id = start(&sender, addr, files(&[&small, &big]));
+    wait_for(|| {
+        receiver
+            .transfers
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|t| t.done > 8 * 1024 * 1024)
+    });
+    sender
+        .transfer(id)
+        .unwrap()
+        .cancel
+        .store(true, Ordering::Relaxed);
+    assert!(!h.join().unwrap());
+    let first = receiver.transfers.lock().unwrap()[0].clone();
+    assert_eq!(first.stage, Stage::Failed);
+    assert!(first.detail.contains("已保留进度"), "{}", first.detail);
+    let parts: Vec<String> = tree(&dest)
+        .into_iter()
+        .filter(|n| n.ends_with(".part"))
+        .collect();
+    assert_eq!(parts.len(), 1, "{:?}", tree(&dest));
+
+    // Sending the same files again finishes them without starting over:
+    // a.txt is not received a second time and the part is used up.
+    let (addr, h) = one_server(receiver.clone());
+    let t = send_now(&sender, addr, files(&[&small, &big]));
+    assert_eq!(t.stage, Stage::Done, "{}", t.detail);
+    assert!(h.join().unwrap());
+    assert_eq!(tree(&dest), ["a.txt", "big.bin"]);
+    assert_eq!(
+        fs::read(dest.join("big.bin")).unwrap(),
+        fs::read(&big).unwrap()
+    );
+    let second = receiver.transfers.lock().unwrap()[1].clone();
+    assert_eq!(second.saved, [dest.join("a.txt"), dest.join("big.bin")]);
+
+    // An edited file gives the batch a new name, so it is not continued.
+    let key = || {
+        batch_key(
+            &scan(std::slice::from_ref(&small), &AtomicBool::new(false))
+                .unwrap()
+                .0,
+        )
+    };
+    let before = key();
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&small, b"HELLO").unwrap();
+    assert_ne!(key(), before);
+}
+
+#[test]
 fn a_changed_identity_stops_sending() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("f"), b"x").unwrap();
@@ -413,6 +476,91 @@ fn another_program_on_the_port_is_reported_as_incompatible() {
     assert!(t.detail.contains("版本"), "{}", t.detail);
 }
 
+#[test]
+fn finished_transfers_are_kept_for_the_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = shared(dir.path());
+    let mut t = Transfer::new(true, "对方", "10.0.0.2");
+    t.items = vec!["报告.pdf".into()];
+    t.sources = vec![dir.path().join("报告.pdf")];
+    t.target = Some(("10.0.0.2:45873".parse().unwrap(), "abcd".into()));
+    t.when = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let (id, _) = before.add(t);
+    let running = before.add(Transfer::new(false, "对方", "10.0.0.2")).0;
+    before.update(id, |t| t.stage = Stage::Declined);
+
+    let after = shared(dir.path());
+    after.load_history();
+    let t = after.transfer(id).expect("kept");
+    assert_eq!(
+        (t.stage, t.title()),
+        (Stage::Declined, "报告.pdf".to_owned())
+    );
+    assert_eq!(t.target.unwrap().1, "abcd");
+    assert_eq!(ago(t.when), "2 小时前");
+    assert!(
+        after.transfer(running).is_none(),
+        "unfinished ones are not kept"
+    );
+    // Clearing the list is kept too.
+    after.transfers.lock().unwrap().clear();
+    after.save_history();
+    let again = shared(dir.path());
+    again.load_history();
+    assert!(again.transfer(id).is_none());
+}
+
+#[test]
+fn slow_or_greedy_connections_cannot_hold_the_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = shared(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || serve_with(listener, s, Duration::from_millis(800)));
+    // One address holds at most MAX_PER_ADDRESS connections; the next one
+    // is closed at once.
+    let held: Vec<TcpStream> = (0..MAX_PER_ADDRESS)
+        .map(|_| TcpStream::connect(addr).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(100));
+    let mut extra = TcpStream::connect(addr).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let start = Instant::now();
+    assert!(matches!(extra.read(&mut [0; 8]), Ok(0) | Err(_)));
+    assert!(start.elapsed() < Duration::from_millis(700));
+    // A connection that trickles its greeting is closed at the deadline,
+    // although each byte arrives well within the read timeout.
+    let mut slow = held.into_iter().next().unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let start = Instant::now();
+    let mut closed = false;
+    for b in b"LANT/2\r" {
+        if slow.write_all(&[*b]).is_err() {
+            closed = true;
+            break;
+        }
+        match slow.read(&mut [0; 8]) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "the trickling connection was not closed");
+    assert!(start.elapsed() < Duration::from_millis(1600));
+}
+
 /// Connect like a sender and hand over the raw offer.
 fn raw_client(addr: SocketAddr, entries: Vec<Entry>) -> Secure {
     let stream = TcpStream::connect(addr).unwrap();
@@ -422,7 +570,11 @@ fn raw_client(addr: SocketAddr, entries: Vec<Entry>) -> Secure {
         platform: Platform::Other,
     };
     let (mut ch, _) = wire::connect(stream, &Identity::generate(), &me).unwrap();
-    ch.send_json(&Offer::Files { entries }).unwrap();
+    ch.send_json(&Offer::Files {
+        entries,
+        resume: String::new(),
+    })
+    .unwrap();
     ch
 }
 

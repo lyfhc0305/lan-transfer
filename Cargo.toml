@@ -27,6 +27,15 @@ demo = []
 # Turns off winit's default menu so ⌘Q asks before quitting.
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30", default-features = false }
+# System notifications (NSUserNotification).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString", "NSUserNotification"] }
+# Quarantine attribute on received files.
+libc = "0.2"
+
+# System notifications (toasts).
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8"
 
 # Development builds on Linux (the release targets are macOS and Windows).
 [target.'cfg(target_os = "linux")'.dependencies]

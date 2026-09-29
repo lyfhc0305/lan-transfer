@@ -1,4 +1,4 @@
-//! Transfers page: running and finished batches of this session.
+//! Transfers page: running batches and the finished ones, kept across runs.
 use super::*;
 use crate::network::{Payload, Target};
 
@@ -65,6 +65,7 @@ impl App {
                 .lock()
                 .unwrap()
                 .retain(|t| !t.stage.finished());
+            self.shared.save_history();
         }
     }
 
@@ -91,7 +92,7 @@ impl App {
                         .color(p.text),
                 );
                 ui.label(
-                    RichText::new("本次运行期间发送和接收的内容会显示在这里")
+                    RichText::new("发送和接收的内容会显示在这里")
                         .font(body(12.5))
                         .color(p.muted),
                 );
@@ -313,7 +314,7 @@ fn transfer_row(ui: &mut Ui, t: &Transfer, selected: bool) -> Option<Action> {
                     parts.push(size(t.total));
                 }
             }
-            parts.push(ago(t.started));
+            parts.push(ago(t.when));
             widgets::truncated(
                 ui,
                 RichText::new(parts.join(" · "))

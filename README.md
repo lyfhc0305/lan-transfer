@@ -13,6 +13,16 @@ Mac 菜单栏 / Windows 系统托盘中的局域网文件互传工具。
 - **界面重新设计。** 主页＝附近的设备＋发送内容＋发送按钮；传输记录与设置为子页面。传输进度显示在主页底部，失败可重试，收到的文件可直接打开或在访达 / 资源管理器中显示。设置即时生效。浅色 / 深色跟随系统。
 - Mac 上 ⌘Q 在有传输时会先询问（关闭了 winit 的默认菜单）。
 
+之后新增（未发版）：
+
+- **开机时自动启动**（设置 › 通用）。启动后直接留在菜单栏 / 托盘，不弹窗口。Mac 写入 `~/Library/LaunchAgents/app.lantransfer.desktop.plist`，Windows 写入 `HKCU\…\CurrentVersion\Run`；每次启动会按程序当前位置更新。
+- **系统通知**（默认开启，可在设置中关闭）。窗口隐藏或不在前面时，收到、发送完成或失败会弹出系统通知。Windows 上点通知会打开窗口。
+- **传输记录会保存**在设置目录的 `history.json`，重启后仍在（最多 200 条，含文字消息内容）；“清除已完成”也会同步清除。
+- **断点续传**。传输中断后，接收方保留已收到的文件和当前文件已收到的部分（`.lantransfer-….part`，保留一周）；发送方点“重试”会从中断处继续。文件在两次发送之间被修改过则从头传。两台电脑都需要是新版本。
+- **收到的文件带来源标记**：Mac 写入 `com.apple.quarantine`，Windows 写入 `Zone.Identifier`（Internet 区域），打开收到的程序时系统会先检查。
+- **检查新版本**（默认开启）：每天用系统自带的 curl 查一次 GitHub Releases，有新版时提示并可下载。
+- **限制占用接收名额的连接**：新连接须在 20 秒内完成握手并发出请求，同一地址最多同时占用 4 个连接（总数 8 个）。
+
 **0.3 与 0.2 协议不兼容**，两台电脑都需要更新。旧设置中的名称、保存位置、接收与托盘选项会保留，旧的连接密钥和“自动接收”不再使用。
 
 详见 [改版说明](docs/改版说明-2026-09-24.md)，使用方法见 [使用说明](packaging/使用说明.txt)。
@@ -31,6 +41,7 @@ Mac 菜单栏 / Windows 系统托盘中的局域网文件互传工具。
 - `src/wire.rs`：Noise 握手与加密分帧。
 - `src/network.rs`：批量发送与接收、条目扫描与校验。
 - `src/discovery.rs`：设备发现。
+- `src/autostart.rs`：开机启动项；`src/notify.rs`：系统通知；`src/registry.rs`：Windows 注册表读写；`src/resume.rs`：断点续传的接收进度；`src/update.rs`：检查新版本。
 - `src/ui/`：`mod.rs`（窗口框架、页眉、提示条、拖放）、`home.rs`（主页）、`transfers.rs`（传输记录）、`settings.rs`（设置）、`dialogs.rs`（收件确认、收到文字、退出确认、输入 IP）、`widgets.rs`、`theme.rs`、`icons.rs`、`tray.rs`、`demo.rs`（截图用演示数据）。
 - `assets/`：界面字体、应用图标及字体许可。`NotoSansSC.ttf` 是可变字体源文件，仅供 `make_fonts.py` 生成两个静态字体，不打包进程序。
 - `packaging/`：Windows 资源、清单及使用说明。
@@ -55,7 +66,7 @@ python3 scripts/build_release.py
 
 ## 测试
 
-`cargo test --release -- --test-threads=1`，共 20 项，说明见 `tests/README.md`。
+`cargo test --release -- --test-threads=1`，共 24 项，说明见 `tests/README.md`。
 
 Linux 仅用于开发和测试：`Cargo.toml` 为 Linux 打开 eframe 的 X11 支持，Linux 版不显示托盘。截图用演示数据：`cargo build --release --features demo` 后以 `LAN_TRANSFER_DEMO=<场景>`（home、busy、text、transfers、settings、request、message、address、exit、toast、empty）和 `LAN_TRANSFER_THEME=dark` 启动；演示模式不收发任何数据。`LAN_TRANSFER_CONFIG_DIR` 可指定独立的设置目录。
 

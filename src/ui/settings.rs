@@ -188,11 +188,51 @@ impl App {
             self.change_settings(|s| s.trusted.retain(|t| t.id != id));
         }
 
-        if self.tray.is_some() {
-            ui.add_space(18.);
-            widgets::section_label(ui, "通用");
-            ui.add_space(-2.);
-            widgets::group(ui, |ui| {
+        ui.add_space(18.);
+        widgets::section_label(ui, "通用");
+        ui.add_space(-2.);
+        widgets::group(ui, |ui| {
+            let mut login = settings.launch_at_login;
+            let description = if self.tray.is_some() {
+                format!("启动后留在{TRAY_PLACE}，随时可以接收")
+            } else {
+                "登录后自动打开，随时可以接收".to_owned()
+            };
+            if widgets::toggle_row(ui, &mut login, "开机时自动启动", Some(&description), true)
+            {
+                match autostart::set(login) {
+                    Ok(()) => self.change_settings(|s| s.launch_at_login = login),
+                    Err(e) => self.notify(Tone::Error, e),
+                }
+            }
+            widgets::separator(ui);
+            let mut notifications = settings.notifications;
+            if widgets::toggle_row(
+                ui,
+                &mut notifications,
+                "系统通知",
+                Some("窗口不在前面时，传输完成或失败会通知你"),
+                true,
+            ) {
+                self.change_settings(|s| s.notifications = notifications);
+            }
+            widgets::separator(ui);
+            let mut updates = settings.check_updates;
+            if widgets::toggle_row(
+                ui,
+                &mut updates,
+                "自动检查更新",
+                Some("每天在 GitHub 上查一次是否有新版本"),
+                true,
+            ) {
+                self.change_settings(|s| s.check_updates = updates);
+                if updates {
+                    let shared = self.shared.clone();
+                    std::thread::spawn(move || update::check(&shared));
+                }
+            }
+            if self.tray.is_some() {
+                widgets::separator(ui);
                 let mut stay = settings.close_to_tray;
                 if widgets::toggle_row(
                     ui,
@@ -203,8 +243,8 @@ impl App {
                 ) {
                     self.change_settings(|s| s.close_to_tray = stay);
                 }
-            });
-        }
+            }
+        });
 
         ui.add_space(20.);
         ui.vertical_centered(|ui| {
@@ -214,6 +254,19 @@ impl App {
                     .font(bold(12.))
                     .color(p.muted),
             );
+            let release = self.shared.update.lock().unwrap().clone();
+            if let Some(r) = release {
+                if ui
+                    .link(
+                        RichText::new(format!("新版本 {} 已发布，点此下载", r.version))
+                            .font(body(11.5))
+                            .color(p.accent),
+                    )
+                    .clicked()
+                {
+                    self.open_link(&r.url);
+                }
+            }
             ui.label(
                 RichText::new(format!(
                     "本机指纹 {} · 端口 {PORT}",
