@@ -17,12 +17,12 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -36,6 +36,11 @@ const MAX_PATH_BYTES: usize = 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_OFFER: usize = 8 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 8;
+/// Connections one address may hold at once, so a single computer cannot
+/// take every slot.
+const MAX_PER_ADDRESS: usize = 4;
+/// Time a new connection has to finish the handshake and send its request.
+const GREETING_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One file or folder in a batch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -618,31 +623,80 @@ pub fn start_receiver(shared: Arc<Shared>) {
 
 /// Accept connections on `listener` until the process ends.
 pub fn serve(listener: TcpListener, shared: Arc<Shared>) {
-    let count = Arc::new(AtomicUsize::new(0));
+    serve_with(listener, shared, GREETING_TIMEOUT)
+}
+
+/// Connections held open, in total and per address.
+#[derive(Default)]
+struct Slots {
+    total: usize,
+    by_address: HashMap<IpAddr, usize>,
+}
+
+/// Frees a connection's slot when dropped.
+struct Slot(Arc<Mutex<Slots>>, IpAddr);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut slots = self.0.lock().unwrap();
+        slots.total -= 1;
+        if let Some(n) = slots.by_address.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                slots.by_address.remove(&self.1);
+            }
+        }
+    }
+}
+
+fn take_slot(slots: &Arc<Mutex<Slots>>, ip: IpAddr) -> Option<Slot> {
+    let mut s = slots.lock().unwrap();
+    let mine = s.by_address.get(&ip).copied().unwrap_or(0);
+    if s.total >= MAX_CONNECTIONS || mine >= MAX_PER_ADDRESS {
+        return None;
+    }
+    s.total += 1;
+    *s.by_address.entry(ip).or_default() += 1;
+    Some(Slot(slots.clone(), ip))
+}
+
+fn serve_with(listener: TcpListener, shared: Arc<Shared>, greeting: Duration) {
+    let slots = Arc::new(Mutex::new(Slots::default()));
     for s in listener.incoming() {
         let Ok(s) = s else {
             continue;
         };
-        if count.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
-            count.fetch_sub(1, Ordering::Relaxed);
+        let Some(slot) = s.peer_addr().ok().and_then(|a| take_slot(&slots, a.ip())) else {
             continue;
-        }
+        };
         let shared = shared.clone();
-        let count = count.clone();
         std::thread::spawn(move || {
-            let _ = handle(s, &shared);
-            count.fetch_sub(1, Ordering::Relaxed);
+            let _ = handle_within(s, &shared, greeting);
+            drop(slot);
         });
     }
 }
 
+#[cfg(test)]
 fn handle(stream: TcpStream, shared: &Arc<Shared>) -> Result<()> {
+    handle_within(stream, shared, GREETING_TIMEOUT)
+}
+
+fn handle_within(stream: TcpStream, shared: &Arc<Shared>, greeting: Duration) -> Result<()> {
     // The handshake and request must arrive promptly, so idle connections
-    // cannot hold the connection slots.
+    // cannot hold the connection slots: each read has 10 s, and all of them
+    // together `greeting`, after which the connection is closed.
     configure(&stream, Duration::from_secs(10))?;
     let ip = stream.peer_addr()?.ip();
+    let watch = stream.try_clone()?;
+    let (greeted, deadline) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if deadline.recv_timeout(greeting) == Err(RecvTimeoutError::Timeout) {
+            let _ = watch.shutdown(Shutdown::Both);
+        }
+    });
     let (mut ch, remote) = wire::accept(stream, &shared.identity, &about(shared))?;
     let offer: Offer = ch.recv_json(MAX_OFFER)?;
+    drop(greeted);
     let settings = shared.settings.lock().unwrap().clone();
     let trusted = settings.is_trusted(&remote.id);
     if trusted {

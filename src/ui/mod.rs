@@ -15,7 +15,7 @@ pub use icons::icon;
 pub use theme::configure;
 pub use tray::make_tray;
 
-use crate::{discovery, model::*, network};
+use crate::{autostart, discovery, model::*, network};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, Context, CursorIcon, Frame, Id, Key, Layout, Margin,
     Order, Rect, RichText, Sense, Shadow, Stroke, Ui, UiBuilder,
@@ -140,6 +140,8 @@ pub struct App {
     addresses: Vec<Ipv4Addr>,
     addresses_at: Option<Instant>,
     content_top: f32,
+    /// Hide the window once eframe has shown it after the first frame.
+    hide_at_start: bool,
 }
 
 impl App {
@@ -174,6 +176,7 @@ impl App {
             addresses: vec![],
             addresses_at: None,
             content_top: 64.,
+            hide_at_start: false,
         };
         if let Some(w) = warning {
             app.notify(Tone::Error, w);
@@ -279,6 +282,12 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    /// Start in the menu bar / tray without showing the window.
+    pub fn start_hidden(&mut self) {
+        self.hide_at_start = true;
+        self.shared.visible.store(false, Ordering::Relaxed);
+    }
+
     fn hide(&mut self, ctx: &Context) {
         self.shared.visible.store(false, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -312,10 +321,7 @@ impl App {
                     let Some(t) = self.shared.transfer(id) else {
                         continue;
                     };
-                    let text = match (t.items.as_slice(), t.files) {
-                        ([one], 1) => format!("已收到「{}」发来的「{one}」", t.peer),
-                        (_, n) => format!("已收到「{}」发来的 {n} 个文件", t.peer),
-                    };
+                    let text = format!("已收到{}", received_summary(&t));
                     match t.saved.as_slice() {
                         [one] => self.notify_with(
                             Tone::Success,
@@ -767,6 +773,22 @@ impl App {
     }
 
     fn ui(&mut self, ctx: &Context) {
+        if self.hide_at_start {
+            // eframe shows the window after painting the first frame. A
+            // request that already brought it back keeps it shown.
+            if self.shared.visible.load(Ordering::Relaxed) {
+                self.hide_at_start = false;
+            } else if ctx.cumulative_pass_nr() > 0 {
+                self.hide_at_start = false;
+                self.hide(ctx);
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        self.shared.focused.store(
+            ctx.input(|i| i.viewport().focused.unwrap_or(true)),
+            Ordering::Relaxed,
+        );
         if self.quit.swap(false, Ordering::Relaxed) {
             self.quit(ctx);
         }

@@ -14,7 +14,7 @@ use std::{
         mpsc::SyncSender,
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// TCP port for transfers and UDP port for discovery.
@@ -81,6 +81,11 @@ pub struct Settings {
     /// Decline requests from devices that are not trusted.
     pub trusted_only: bool,
     pub close_to_tray: bool,
+    /// Start with the computer, hidden in the menu bar / tray.
+    pub launch_at_login: bool,
+    /// Show a system notification when a transfer ends while the window is
+    /// hidden or in the background.
+    pub notifications: bool,
     pub trusted: Vec<TrustedDevice>,
 }
 
@@ -96,6 +101,8 @@ impl Default for Settings {
             receive: true,
             trusted_only: false,
             close_to_tray: true,
+            launch_at_login: false,
+            notifications: true,
             trusted: vec![],
         }
     }
@@ -209,6 +216,21 @@ pub fn config_path() -> PathBuf {
     config_dir().join("settings.json")
 }
 
+fn history_path() -> PathBuf {
+    config_dir().join("history.json")
+}
+
+/// Write `data` to `path` so that a crash never leaves half a file.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let dir = path.parent().ok_or("设置路径不可用")?;
+    fs::create_dir_all(dir).map_err(|e| format!("无法创建设置目录：{e}"))?;
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    file.write_all(data).map_err(|e| e.to_string())?;
+    file.as_file().sync_all().map_err(|e| e.to_string())?;
+    file.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Load settings; the second value is a warning to show when they could not
 /// be read. New identities are saved right away so the device ID is stable.
 pub fn load_settings() -> (Settings, Option<String>) {
@@ -237,15 +259,10 @@ pub fn save_settings(s: &Settings) -> Result<(), String> {
     if Identity::from_hex(&s.identity).is_none() {
         return Err("设备密钥无效".into());
     }
-    let p = config_path();
-    let dir = p.parent().ok_or("设置路径不可用")?;
-    fs::create_dir_all(dir).map_err(|e| format!("无法创建设置目录：{e}"))?;
-    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
-    file.write_all(&serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    file.as_file().sync_all().map_err(|e| e.to_string())?;
-    file.persist(&p).map_err(|e| e.to_string())?;
-    Ok(())
+    write_atomic(
+        &config_path(),
+        &serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?,
+    )
 }
 
 /// A computer found on the network (or typed in by address).
@@ -259,7 +276,8 @@ pub struct Peer {
     pub seen: Instant,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Stage {
     /// Listing folders before sending.
     Preparing,
@@ -311,6 +329,8 @@ pub struct Transfer {
     /// What was picked to send and where to, so a failed batch can be retried.
     pub sources: Vec<PathBuf>,
     pub target: Option<(SocketAddr, String)>,
+    /// When it started, as shown in the list ("3 分钟前").
+    pub when: SystemTime,
     pub started: Instant,
     pub ended: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
@@ -336,6 +356,7 @@ impl Transfer {
             saved: vec![],
             sources: vec![],
             target: None,
+            when: SystemTime::now(),
             started: Instant::now(),
             ended: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -382,6 +403,77 @@ impl Transfer {
     }
 }
 
+/// A finished transfer as kept in `history.json`, so the list survives a
+/// restart.
+#[derive(Serialize, Deserialize)]
+struct Record {
+    id: u64,
+    outgoing: bool,
+    #[serde(default)]
+    text: Option<String>,
+    peer: String,
+    address: String,
+    #[serde(default)]
+    items: Vec<String>,
+    files: usize,
+    total: u64,
+    done: u64,
+    stage: Stage,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    saved: Vec<PathBuf>,
+    #[serde(default)]
+    sources: Vec<PathBuf>,
+    #[serde(default)]
+    target: Option<(SocketAddr, String)>,
+    /// Seconds since 1970.
+    when: u64,
+}
+
+impl Record {
+    fn from(t: &Transfer) -> Self {
+        Self {
+            id: t.id,
+            outgoing: t.outgoing,
+            text: t.text.clone(),
+            peer: t.peer.clone(),
+            address: t.address.clone(),
+            items: t.items.clone(),
+            files: t.files,
+            total: t.total,
+            done: t.done,
+            stage: t.stage,
+            detail: t.detail.clone(),
+            saved: t.saved.clone(),
+            sources: t.sources.clone(),
+            target: t.target.clone(),
+            when: t
+                .when
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
+    }
+    fn into_transfer(self) -> Transfer {
+        let mut t = Transfer::new(self.outgoing, self.peer, self.address);
+        t.id = self.id;
+        t.text = self.text;
+        t.items = self.items;
+        t.files = self.files;
+        t.total = self.total;
+        t.done = self.done;
+        t.files_done = self.files;
+        t.stage = self.stage;
+        t.detail = self.detail;
+        t.saved = self.saved;
+        t.sources = self.sources;
+        t.target = self.target;
+        t.when = SystemTime::UNIX_EPOCH + Duration::from_secs(self.when);
+        t.ended = Some(t.started);
+        t
+    }
+}
+
 /// Summary of one top-level item in an incoming request.
 #[derive(Clone, Debug)]
 pub struct ItemSummary {
@@ -422,6 +514,14 @@ pub struct Message {
     pub text: String,
 }
 
+/// "「Mac mini」发来的「报告.pdf」" or "「Mac mini」发来的 3 个文件".
+pub fn received_summary(t: &Transfer) -> String {
+    match (t.items.as_slice(), t.files) {
+        ([one], 1) => format!("「{}」发来的「{one}」", t.peer),
+        (_, n) => format!("「{}」发来的 {n} 个文件", t.peer),
+    }
+}
+
 /// Something that happened in the background, shown once as a notice.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Paste
@@ -434,6 +534,7 @@ pub enum Event {
 }
 
 pub struct Shared {
+    me: std::sync::Weak<Shared>,
     pub settings: Mutex<Settings>,
     pub identity: Identity,
     pub peers: Mutex<Vec<Peer>>,
@@ -441,6 +542,8 @@ pub struct Shared {
     pub requests: Mutex<Vec<Request>>,
     pub messages: Mutex<Vec<Message>>,
     pub events: Mutex<Vec<Event>>,
+    /// Held while `history.json` is written, so saves do not interleave.
+    history_lock: Mutex<()>,
     /// Lasting problem with receiving (port in use).
     pub receiver_note: Mutex<Option<String>>,
     /// Lasting problem with discovery (UDP port in use).
@@ -454,6 +557,8 @@ pub struct Shared {
     pub window: AtomicIsize,
     /// False while the window is hidden in the menu bar / tray.
     pub visible: AtomicBool,
+    /// False while another application is in front.
+    pub focused: AtomicBool,
     pub ctx: egui::Context,
 }
 
@@ -462,7 +567,8 @@ impl Shared {
         let mut settings = settings;
         settings.complete();
         let identity = Identity::from_hex(&settings.identity).expect("completed above");
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             settings: Mutex::new(settings),
             identity,
             peers: Mutex::new(vec![]),
@@ -470,6 +576,7 @@ impl Shared {
             requests: Mutex::new(vec![]),
             messages: Mutex::new(vec![]),
             events: Mutex::new(vec![]),
+            history_lock: Mutex::new(()),
             receiver_note: Mutex::new(None),
             discovery_note: Mutex::new(None),
             ready: AtomicBool::new(false),
@@ -477,11 +584,16 @@ impl Shared {
             manual: Mutex::new(vec![]),
             window: AtomicIsize::new(0),
             visible: AtomicBool::new(true),
+            focused: AtomicBool::new(true),
             ctx,
         })
     }
     pub fn id(&self) -> String {
         self.identity.id()
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn me(&self) -> std::sync::Weak<Shared> {
+        self.me.clone()
     }
     pub fn wake(&self) {
         self.ctx.request_repaint();
@@ -502,8 +614,75 @@ impl Shared {
         self.wake();
     }
     pub fn event(&self, e: Event) {
+        self.notify_system(&e);
         self.events.lock().unwrap().push(e);
         self.wake();
+    }
+    /// A system notification for a transfer that ended while the window is
+    /// out of sight, where the notice inside the window would go unseen.
+    fn notify_system(&self, e: &Event) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.settings.lock().unwrap().notifications
+            || (self.visible.load(Relaxed) && self.focused.load(Relaxed))
+        {
+            return;
+        }
+        let (id, failed) = match e {
+            Event::Received { id } | Event::Sent { id } => (*id, false),
+            Event::Failed { id } => (*id, true),
+            _ => return,
+        };
+        let Some(t) = self.transfer(id) else {
+            return;
+        };
+        let (title, body) = match (t.outgoing, failed) {
+            (false, false) => ("已收到".to_owned(), received_summary(&t)),
+            (true, false) => (format!("已发送给「{}」", t.peer), t.title()),
+            (outgoing, true) => (
+                if outgoing {
+                    "发送失败"
+                } else {
+                    "接收失败"
+                }
+                .to_owned(),
+                format!("{}：{}", t.title(), t.detail),
+            ),
+        };
+        crate::notify::show(self, &title, &body);
+    }
+    /// Read the transfers kept from earlier runs.
+    pub fn load_history(&self) {
+        let Ok(data) = fs::read(history_path()) else {
+            return;
+        };
+        let Ok(records) = serde_json::from_slice::<Vec<Record>>(&data) else {
+            return;
+        };
+        let mut list = self.transfers.lock().unwrap();
+        let old: Vec<Transfer> = records
+            .into_iter()
+            .filter(|r| r.stage.finished())
+            .map(Record::into_transfer)
+            .filter(|t| !list.iter().any(|x| x.id == t.id))
+            .collect();
+        list.splice(0..0, old);
+        drop(list);
+        self.wake();
+    }
+    /// Keep the finished transfers for the next run.
+    pub fn save_history(&self) {
+        let _saving = self.history_lock.lock().unwrap();
+        let records: Vec<Record> = self
+            .transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.stage.finished())
+            .map(Record::from)
+            .collect();
+        if let Ok(data) = serde_json::to_vec(&records) {
+            let _ = write_atomic(&history_path(), &data);
+        }
     }
     pub fn add(&self, t: Transfer) -> (u64, Arc<AtomicBool>) {
         let (id, cancel) = (t.id, t.cancel.clone());
@@ -516,12 +695,17 @@ impl Shared {
                 None => break,
             }
         }
+        let finished = t.stage.finished();
         list.push(t);
         drop(list);
+        if finished {
+            self.save_history();
+        }
         self.wake();
         (id, cancel)
     }
     pub fn update(&self, id: u64, f: impl FnOnce(&mut Transfer)) {
+        let mut ended = false;
         if let Some(t) = self
             .transfers
             .lock()
@@ -532,7 +716,11 @@ impl Shared {
             f(t);
             if t.stage.finished() && t.ended.is_none() {
                 t.ended = Some(Instant::now());
+                ended = true;
             }
+        }
+        if ended {
+            self.save_history();
         }
         self.wake();
     }
@@ -593,8 +781,8 @@ pub fn duration(d: Duration) -> String {
 }
 
 /// "刚刚", "5 分钟前", "2 小时前".
-pub fn ago(t: Instant) -> String {
-    let s = t.elapsed().as_secs();
+pub fn ago(t: SystemTime) -> String {
+    let s = t.elapsed().map_or(0, |d| d.as_secs());
     if s < 60 {
         "刚刚".into()
     } else if s < 3600 {

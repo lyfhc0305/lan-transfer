@@ -188,11 +188,36 @@ impl App {
             self.change_settings(|s| s.trusted.retain(|t| t.id != id));
         }
 
-        if self.tray.is_some() {
-            ui.add_space(18.);
-            widgets::section_label(ui, "通用");
-            ui.add_space(-2.);
-            widgets::group(ui, |ui| {
+        ui.add_space(18.);
+        widgets::section_label(ui, "通用");
+        ui.add_space(-2.);
+        widgets::group(ui, |ui| {
+            let mut login = settings.launch_at_login;
+            let description = if self.tray.is_some() {
+                format!("启动后留在{TRAY_PLACE}，随时可以接收")
+            } else {
+                "登录后自动打开，随时可以接收".to_owned()
+            };
+            if widgets::toggle_row(ui, &mut login, "开机时自动启动", Some(&description), true)
+            {
+                match autostart::set(login) {
+                    Ok(()) => self.change_settings(|s| s.launch_at_login = login),
+                    Err(e) => self.notify(Tone::Error, e),
+                }
+            }
+            widgets::separator(ui);
+            let mut notifications = settings.notifications;
+            if widgets::toggle_row(
+                ui,
+                &mut notifications,
+                "系统通知",
+                Some("窗口不在前面时，传输完成或失败会通知你"),
+                true,
+            ) {
+                self.change_settings(|s| s.notifications = notifications);
+            }
+            if self.tray.is_some() {
+                widgets::separator(ui);
                 let mut stay = settings.close_to_tray;
                 if widgets::toggle_row(
                     ui,
@@ -203,8 +228,8 @@ impl App {
                 ) {
                     self.change_settings(|s| s.close_to_tray = stay);
                 }
-            });
-        }
+            }
+        });
 
         ui.add_space(20.);
         ui.vertical_centered(|ui| {

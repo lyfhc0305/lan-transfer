@@ -413,6 +413,91 @@ fn another_program_on_the_port_is_reported_as_incompatible() {
     assert!(t.detail.contains("版本"), "{}", t.detail);
 }
 
+#[test]
+fn finished_transfers_are_kept_for_the_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = shared(dir.path());
+    let mut t = Transfer::new(true, "对方", "10.0.0.2");
+    t.items = vec!["报告.pdf".into()];
+    t.sources = vec![dir.path().join("报告.pdf")];
+    t.target = Some(("10.0.0.2:45873".parse().unwrap(), "abcd".into()));
+    t.when = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let (id, _) = before.add(t);
+    let running = before.add(Transfer::new(false, "对方", "10.0.0.2")).0;
+    before.update(id, |t| t.stage = Stage::Declined);
+
+    let after = shared(dir.path());
+    after.load_history();
+    let t = after.transfer(id).expect("kept");
+    assert_eq!(
+        (t.stage, t.title()),
+        (Stage::Declined, "报告.pdf".to_owned())
+    );
+    assert_eq!(t.target.unwrap().1, "abcd");
+    assert_eq!(ago(t.when), "2 小时前");
+    assert!(
+        after.transfer(running).is_none(),
+        "unfinished ones are not kept"
+    );
+    // Clearing the list is kept too.
+    after.transfers.lock().unwrap().clear();
+    after.save_history();
+    let again = shared(dir.path());
+    again.load_history();
+    assert!(again.transfer(id).is_none());
+}
+
+#[test]
+fn slow_or_greedy_connections_cannot_hold_the_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = shared(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || serve_with(listener, s, Duration::from_millis(800)));
+    // One address holds at most MAX_PER_ADDRESS connections; the next one
+    // is closed at once.
+    let held: Vec<TcpStream> = (0..MAX_PER_ADDRESS)
+        .map(|_| TcpStream::connect(addr).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(100));
+    let mut extra = TcpStream::connect(addr).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let start = Instant::now();
+    assert!(matches!(extra.read(&mut [0; 8]), Ok(0) | Err(_)));
+    assert!(start.elapsed() < Duration::from_millis(700));
+    // A connection that trickles its greeting is closed at the deadline,
+    // although each byte arrives well within the read timeout.
+    let mut slow = held.into_iter().next().unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let start = Instant::now();
+    let mut closed = false;
+    for b in b"LANT/2\r" {
+        if slow.write_all(&[*b]).is_err() {
+            closed = true;
+            break;
+        }
+        match slow.read(&mut [0; 8]) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "the trickling connection was not closed");
+    assert!(start.elapsed() < Duration::from_millis(1600));
+}
+
 /// Connect like a sender and hand over the raw offer.
 fn raw_client(addr: SocketAddr, entries: Vec<Entry>) -> Secure {
     let stream = TcpStream::connect(addr).unwrap();
