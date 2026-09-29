@@ -912,3 +912,40 @@ fn shortcut_item(ui: &mut Ui, label: &str, key: Key, enabled: bool) -> Response 
         response
     }
 }
+
+/// On the Mac, Control-click is a right-click (for mice with one button and
+/// trackpads without two-finger click). egui only knows real right-clicks,
+/// so the Control-clicks are turned into right-clicks before egui sees them.
+pub fn control_click_as_right_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let held = Id::new("control-click-held");
+    for event in &mut raw.events {
+        let Event::PointerButton {
+            button,
+            pressed,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if *button != PointerButton::Primary {
+            continue;
+        }
+        // The release counts as a right-click too even if Control was let
+        // go first, so egui never sees a left button that stays down.
+        let right = if *pressed {
+            let control = modifiers.ctrl && !modifiers.mac_cmd;
+            ctx.data_mut(|d| d.insert_temp(held, control));
+            control
+        } else {
+            ctx.data_mut(|d| d.remove_temp::<bool>(held))
+                .unwrap_or(false)
+        };
+        if right {
+            *button = PointerButton::Secondary;
+        }
+    }
+}

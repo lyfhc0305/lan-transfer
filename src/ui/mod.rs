@@ -679,6 +679,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
+
+    fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        widgets::control_click_as_right_click(ctx, raw_input);
+    }
 }
 
 impl App {
