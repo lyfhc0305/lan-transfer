@@ -216,6 +216,21 @@ impl App {
             ) {
                 self.change_settings(|s| s.notifications = notifications);
             }
+            widgets::separator(ui);
+            let mut updates = settings.check_updates;
+            if widgets::toggle_row(
+                ui,
+                &mut updates,
+                "自动检查更新",
+                Some("每天在 GitHub 上查一次是否有新版本"),
+                true,
+            ) {
+                self.change_settings(|s| s.check_updates = updates);
+                if updates {
+                    let shared = self.shared.clone();
+                    std::thread::spawn(move || update::check(&shared));
+                }
+            }
             if self.tray.is_some() {
                 widgets::separator(ui);
                 let mut stay = settings.close_to_tray;
@@ -239,6 +254,19 @@ impl App {
                     .font(bold(12.))
                     .color(p.muted),
             );
+            let release = self.shared.update.lock().unwrap().clone();
+            if let Some(r) = release {
+                if ui
+                    .link(
+                        RichText::new(format!("新版本 {} 已发布，点此下载", r.version))
+                            .font(body(11.5))
+                            .color(p.accent),
+                    )
+                    .clicked()
+                {
+                    self.open_link(&r.url);
+                }
+            }
             ui.label(
                 RichText::new(format!(
                     "本机指纹 {} · 端口 {PORT}",

@@ -7,6 +7,7 @@ mod notify;
 #[cfg(windows)]
 mod registry;
 mod ui;
+mod update;
 mod wire;
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -125,6 +126,7 @@ fn main() {
                 });
             network::start_receiver(shared.clone());
             discovery::start(shared.clone());
+            update::start(shared.clone());
             #[allow(unused_mut)]
             let has_tray = tray.is_ok();
             let mut app = ui::App::new(shared, quit, tray.ok(), warning.or(tray_error));

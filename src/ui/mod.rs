@@ -15,7 +15,7 @@ pub use icons::icon;
 pub use theme::configure;
 pub use tray::make_tray;
 
-use crate::{autostart, discovery, model::*, network};
+use crate::{autostart, discovery, model::*, network, update};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, Context, CursorIcon, Frame, Id, Key, Layout, Margin,
     Order, Rect, RichText, Sense, Shadow, Stroke, Ui, UiBuilder,
@@ -73,6 +73,7 @@ enum Tone {
 #[derive(Clone, Debug)]
 enum ToastAction {
     Show(PathBuf),
+    Link(String),
     OpenFolder(PathBuf),
     Transfers,
 }
@@ -361,6 +362,17 @@ impl App {
                     }
                 }
                 Event::Note(text) => self.notify(Tone::Info, text),
+                Event::Update => {
+                    let release = self.shared.update.lock().unwrap().clone();
+                    if let Some(r) = release {
+                        self.notify_with(
+                            Tone::Info,
+                            format!("邻传 {} 已发布", r.version),
+                            "下载",
+                            ToastAction::Link(r.url),
+                        );
+                    }
+                }
                 Event::Paste => {
                     let ctx = self.shared.ctx.clone();
                     if ctx.wants_keyboard_input() {
@@ -566,6 +578,7 @@ impl App {
         if let Some(act) = run {
             match act {
                 ToastAction::Show(path) => self.reveal(&path),
+                ToastAction::Link(url) => self.open_link(&url),
                 ToastAction::OpenFolder(path) => self.open_folder(&path),
                 ToastAction::Transfers => self.page = Page::Transfers,
             }
@@ -622,6 +635,12 @@ impl App {
     fn open_file(&mut self, path: &Path) {
         if let Err(e) = open::that_detached(path) {
             self.notify(Tone::Error, format!("无法打开：{e}"));
+        }
+    }
+
+    fn open_link(&mut self, url: &str) {
+        if let Err(e) = open::that_detached(url) {
+            self.notify(Tone::Error, format!("无法打开链接：{e}"));
         }
     }
 

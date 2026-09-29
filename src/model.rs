@@ -86,6 +86,8 @@ pub struct Settings {
     /// Show a system notification when a transfer ends while the window is
     /// hidden or in the background.
     pub notifications: bool,
+    /// Look for a newer version on GitHub once a day.
+    pub check_updates: bool,
     pub trusted: Vec<TrustedDevice>,
 }
 
@@ -103,6 +105,7 @@ impl Default for Settings {
             close_to_tray: true,
             launch_at_login: false,
             notifications: true,
+            check_updates: true,
             trusted: vec![],
         }
     }
@@ -526,10 +529,18 @@ pub fn received_summary(t: &Transfer) -> String {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Paste
 pub enum Event {
-    Received { id: u64 },
-    Sent { id: u64 },
-    Failed { id: u64 },
+    Received {
+        id: u64,
+    },
+    Sent {
+        id: u64,
+    },
+    Failed {
+        id: u64,
+    },
     Note(String),
+    /// A newer version was found, see [`Shared::update`].
+    Update,
     Paste, // chosen from the macOS Edit menu
 }
 
@@ -542,6 +553,8 @@ pub struct Shared {
     pub requests: Mutex<Vec<Request>>,
     pub messages: Mutex<Vec<Message>>,
     pub events: Mutex<Vec<Event>>,
+    /// Newer version found on GitHub.
+    pub update: Mutex<Option<crate::update::Release>>,
     /// Held while `history.json` is written, so saves do not interleave.
     history_lock: Mutex<()>,
     /// Lasting problem with receiving (port in use).
@@ -576,6 +589,7 @@ impl Shared {
             requests: Mutex::new(vec![]),
             messages: Mutex::new(vec![]),
             events: Mutex::new(vec![]),
+            update: Mutex::new(None),
             history_lock: Mutex::new(()),
             receiver_note: Mutex::new(None),
             discovery_note: Mutex::new(None),

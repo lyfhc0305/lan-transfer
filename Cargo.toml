@@ -30,6 +30,8 @@ winit = { version = "0.30", default-features = false }
 # System notifications (NSUserNotification).
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString", "NSUserNotification"] }
+# Quarantine attribute on received files.
+libc = "0.2"
 
 # System notifications (toasts).
 [target.'cfg(windows)'.dependencies]

@@ -947,7 +947,44 @@ fn receive_file(
     if ch.recv()? != hash.finalize().as_slice() {
         return Err(fail("文件校验失败：内容在传输中损坏"));
     }
+    mark_received(temp.path());
     Ok(temp)
+}
+
+/// Mark a received file as coming from another computer, as browsers do
+/// with downloads: Gatekeeper / SmartScreen then check programs before they
+/// first run, and Office opens documents in Protected View.
+fn mark_received(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let value = format!("0081;{secs:08x};邻传;");
+        if let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            // SAFETY: NUL-terminated path and name; the value outlives the call.
+            unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"com.apple.quarantine".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Internet zone, as for downloads. Ignored on non-NTFS drives.
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        let _ = fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n");
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = path;
 }
 
 /// Save a received top-level file under its name, or "name (2)" and so on
