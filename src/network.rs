@@ -9,6 +9,7 @@
 //! 4. receiver → `Receipt` once everything is saved
 use crate::{
     model::*,
+    resume,
     wire::{self, fail, About, Error, Remote, Result, Secure},
 };
 use serde::{Deserialize, Serialize};
@@ -57,8 +58,16 @@ pub struct Entry {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Offer {
-    Files { entries: Vec<Entry> },
-    Text { text: String },
+    Files {
+        entries: Vec<Entry>,
+        /// Names the batch so a receiver can continue it after a break;
+        /// empty from versions without resuming.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        resume: String,
+    },
+    Text {
+        text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,6 +75,35 @@ struct Reply {
     accept: bool,
     #[serde(default)]
     reason: String,
+    /// Where to continue a batch that broke off; only sent to senders that
+    /// named the batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<ResumeAt>,
+}
+
+impl Reply {
+    fn yes(resume: Option<ResumeAt>) -> Self {
+        Self {
+            accept: true,
+            reason: String::new(),
+            resume,
+        }
+    }
+    fn no(reason: impl Into<String>) -> Self {
+        Self {
+            accept: false,
+            reason: reason.into(),
+            resume: None,
+        }
+    }
+}
+
+/// The first `files` files (not folders) of the batch are already saved,
+/// and `offset` bytes of the next one.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+struct ResumeAt {
+    files: usize,
+    offset: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -554,6 +592,11 @@ impl<'a> Progress<'a> {
             self.publish();
         }
     }
+    /// Bytes already there from an earlier attempt; not counted in speed.
+    fn skip(&mut self, n: u64) {
+        self.done += n;
+        self.tick_done += n;
+    }
     fn file_done(&mut self) {
         self.files += 1;
     }
@@ -617,6 +660,7 @@ pub fn start_receiver(shared: Arc<Shared>) {
         };
         shared.ready.store(true, Ordering::Relaxed);
         shared.wake();
+        resume::expire();
         serve(listener, shared);
     });
 }
@@ -710,16 +754,26 @@ fn handle_within(stream: TcpStream, shared: &Arc<Shared>, greeting: Duration) ->
         None
     };
     if let Some(reason) = refusal {
-        ch.send_json(&Reply {
-            accept: false,
-            reason: reason.into(),
-        })?;
+        ch.send_json(&Reply::no(reason))?;
         return Ok(());
     }
     match offer {
         Offer::Text { text } => receive_text(ch, shared, &remote, ip, text),
-        Offer::Files { entries } => {
-            receive_files(ch, shared, &remote, ip, entries, trusted, &settings.folder)
+        Offer::Files {
+            entries,
+            resume: batch,
+        } => {
+            let key = resume::valid_key(&batch).then_some(batch.as_str());
+            receive_files(
+                ch,
+                shared,
+                &remote,
+                ip,
+                entries,
+                key,
+                trusted,
+                &settings.folder,
+            )
         }
     }
 }
@@ -732,16 +786,10 @@ fn receive_text(
     text: String,
 ) -> Result<()> {
     if text.trim().is_empty() || text.len() > MAX_TEXT {
-        ch.send_json(&Reply {
-            accept: false,
-            reason: "文字为空或过长".into(),
-        })?;
+        ch.send_json(&Reply::no("文字为空或过长"))?;
         return Err(fail("文字为空或过长"));
     }
-    ch.send_json(&Reply {
-        accept: true,
-        reason: String::new(),
-    })?;
+    ch.send_json(&Reply::yes(None))?;
     let mut t = Transfer::new(false, &remote.about.name, ip.to_string());
     t.text = Some(text.clone());
     t.total = text.len() as u64;
@@ -757,20 +805,55 @@ fn receive_text(
     Ok(())
 }
 
+/// Hash of a batch's entries, to recognise it when it is sent again.
+fn entries_hash(entries: &[Entry]) -> String {
+    to_hex(&Sha256::digest(
+        serde_json::to_vec(entries).unwrap_or_default(),
+    ))
+}
+
+/// Where an earlier attempt at this batch stopped, if it can be continued.
+fn resumable(key: &str, remote: &Remote, entries: &[Entry], folder: &Path) -> Option<Partial> {
+    let state = resume::load(key)?;
+    let sizes: Vec<u64> = entries.iter().filter(|e| !e.dir).map(|e| e.size).collect();
+    if state.sender != remote.id
+        || state.entries != entries_hash(entries)
+        || state.root != folder
+        || state.files_done > sizes.len()
+    {
+        resume::clear(key);
+        return None;
+    }
+    let part = state.part.filter(|part| {
+        let fits = fs::metadata(part)
+            .is_ok_and(|m| state.files_done < sizes.len() && m.len() <= sizes[state.files_done]);
+        if !fits {
+            let _ = fs::remove_file(part);
+        }
+        fits
+    });
+    Some(Partial {
+        files_done: state.files_done,
+        folders: state.folders.into_iter().collect(),
+        saved: state.saved,
+        part,
+        current: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn receive_files(
     mut ch: Secure,
     shared: &Shared,
     remote: &Remote,
     ip: IpAddr,
     entries: Vec<Entry>,
+    key: Option<&str>,
     trusted: bool,
     folder: &Path,
 ) -> Result<()> {
     if let Err(e) = validate(&entries) {
-        let _ = ch.send_json(&Reply {
-            accept: false,
-            reason: describe(e.as_ref()),
-        });
+        let _ = ch.send_json(&Reply::no(describe(e.as_ref())));
         return Err(e);
     }
     let items = summarize(&entries);
@@ -782,7 +865,16 @@ fn receive_files(
     let (files, total) = (t.files, t.total);
     let (id, cancel) = shared.add(t);
     let _watch = watch_cancel(ch.stream(), &cancel)?;
-    let mut saved = vec![];
+    let earlier = key.and_then(|k| resumable(k, remote, &entries, folder));
+    let resume_at = earlier.as_ref().map(|p| ResumeAt {
+        files: p.files_done,
+        offset: p
+            .part
+            .as_ref()
+            .and_then(|part| fs::metadata(part).ok())
+            .map_or(0, |m| m.len()),
+    });
+    let mut partial = earlier.unwrap_or_default();
     let outcome = (|| -> Result<()> {
         if !trusted {
             let (tx, rx) = mpsc::sync_channel(1);
@@ -813,47 +905,51 @@ fn receive_files(
                 Decision::Accepted { trust: false } => {}
                 Decision::SenderLeft => return Err(ended(Stage::Cancelled, "对方已取消发送")),
                 Decision::Rejected => {
-                    let _ = ch.send_json(&Reply {
-                        accept: false,
-                        reason: "对方拒绝了接收".into(),
-                    });
+                    let _ = ch.send_json(&Reply::no("对方拒绝了接收"));
                     return Err(ended(Stage::Declined, "已拒绝"));
                 }
                 Decision::TimedOut => {
-                    let _ = ch.send_json(&Reply {
-                        accept: false,
-                        reason: "对方没有在两分钟内确认".into(),
-                    });
+                    let _ = ch.send_json(&Reply::no("对方没有在两分钟内确认"));
                     return Err(ended(Stage::Declined, "超时未确认，已自动拒绝"));
                 }
             }
         }
         cancelled(&cancel)?;
         if let Err(e) = fs::create_dir_all(folder) {
-            let _ = ch.send_json(&Reply {
-                accept: false,
-                reason: "对方无法写入接收文件夹".into(),
-            });
+            let _ = ch.send_json(&Reply::no("对方无法写入接收文件夹"));
             return Err(fail(format!("无法创建接收文件夹：{}", describe(&e))));
         }
-        ch.send_json(&Reply {
-            accept: true,
-            reason: String::new(),
-        })?;
+        ch.send_json(&Reply::yes(resume_at))?;
         shared.update(id, |t| t.stage = Stage::Running);
         configure(ch.stream(), Duration::from_secs(30))?;
-        receive_entries(&mut ch, shared, id, &cancel, folder, &entries, &mut saved)?;
+        receive_entries(&mut ch, shared, id, &cancel, folder, &entries, &mut partial)?;
         ch.send_json(&Receipt {
             ok: true,
             reason: String::new(),
         })?;
         Ok(())
     })();
+    let kept = key.is_some_and(|key| {
+        keep_or_forget(
+            key,
+            &outcome,
+            &cancel,
+            remote,
+            &entries,
+            folder,
+            &mut partial,
+        )
+    });
+    let saved = partial.saved.clone();
     shared.update(id, |t| {
         t.saved = saved.clone();
         conclude(t, &outcome, &cancel);
-        if t.stage == Stage::Failed && !saved.is_empty() {
-            t.detail = format!("{}（已保存的部分可以打开）", t.detail);
+        if t.stage == Stage::Failed {
+            if kept {
+                t.detail = format!("{}（已保留进度，对方重新发送时会接着传）", t.detail);
+            } else if !saved.is_empty() {
+                t.detail = format!("{}（已保存的部分可以打开）", t.detail);
+            }
         }
     });
     match &outcome {
@@ -866,6 +962,79 @@ fn receive_files(
     outcome
 }
 
+/// After a batch: keep what arrived when it broke off, so sending it again
+/// continues from there; forget it once it is done, declined or cancelled
+/// here. Returns whether something was kept.
+fn keep_or_forget(
+    key: &str,
+    outcome: &Result<()>,
+    cancel: &AtomicBool,
+    remote: &Remote,
+    entries: &[Entry],
+    folder: &Path,
+    partial: &mut Partial,
+) -> bool {
+    let ended = match outcome {
+        Ok(()) => None,
+        Err(e) => Some(e.downcast_ref::<Ended>()),
+    };
+    match ended {
+        // The sender left before it was accepted: nothing changed.
+        Some(Some(Ended(Stage::Cancelled, _))) if !cancel.load(Ordering::Relaxed) => false,
+        Some(None) if !cancel.load(Ordering::Relaxed) => {
+            let part = match partial.current.take() {
+                Some(temp) => {
+                    let dir = temp.path().parent().map(Path::to_path_buf);
+                    match dir {
+                        Some(dir) if temp.as_file().metadata().is_ok_and(|m| m.len() > 0) => {
+                            let path = resume::part_path(&dir, key);
+                            temp.persist(&path).ok().map(|_| path)
+                        }
+                        _ => None,
+                    }
+                }
+                // Broke off before the kept part was reached.
+                None => partial.part.take(),
+            };
+            if partial.files_done == 0 && part.is_none() {
+                resume::clear(key);
+                return false;
+            }
+            resume::save(
+                key,
+                &resume::State {
+                    sender: remote.id.clone(),
+                    entries: entries_hash(entries),
+                    root: folder.to_path_buf(),
+                    files_done: partial.files_done,
+                    folders: partial.folders.clone().into_iter().collect(),
+                    saved: partial.saved.clone(),
+                    part,
+                },
+            );
+            true
+        }
+        _ => {
+            resume::clear(key);
+            false
+        }
+    }
+}
+
+/// How far a batch got: carried over from an earlier attempt, and kept if
+/// this one breaks off too.
+#[derive(Default)]
+struct Partial {
+    /// Files (not folders) saved, in list order.
+    files_done: usize,
+    folders: HashMap<String, PathBuf>,
+    saved: Vec<PathBuf>,
+    /// Part of the next file, kept from an earlier attempt.
+    part: Option<PathBuf>,
+    /// File being received.
+    current: Option<tempfile::NamedTempFile>,
+}
+
 fn receive_entries(
     ch: &mut Secure,
     shared: &Shared,
@@ -873,31 +1042,41 @@ fn receive_entries(
     cancel: &AtomicBool,
     root: &Path,
     entries: &[Entry],
-    saved: &mut Vec<PathBuf>,
+    partial: &mut Partial,
 ) -> Result<()> {
     // Top-level folders get a free name in the receive folder; everything
     // inside them lands in the new folder, so it cannot collide.
-    let mut folders: HashMap<&str, PathBuf> = HashMap::new();
     let mut progress = Progress::new(shared, id);
+    let mut files = 0;
     for e in entries {
         cancelled(cancel)?;
         let (top, rest) = match e.path.split_once('/') {
             Some((top, rest)) => (top, Some(rest)),
             None => (e.path.as_str(), None),
         };
+        if !e.dir {
+            files += 1;
+            if files <= partial.files_done {
+                // Saved by an earlier attempt.
+                progress.skip(e.size);
+                progress.file_done();
+                continue;
+            }
+        }
         if !e.dir && rest.is_none() {
             progress.file(&e.path);
-            let temp = receive_file(ch, e.size, root, cancel, &mut progress)?;
-            saved.push(persist_free(temp, root, top)?);
+            let temp = receive_file(ch, e.size, root, partial, cancel, &mut progress)?;
+            partial.saved.push(persist_free(temp, root, top)?);
+            partial.files_done += 1;
             progress.file_done();
             continue;
         }
-        let base = match folders.get(top) {
+        let base = match partial.folders.get(top) {
             Some(p) => p.clone(),
             None => {
                 let p = claim_folder(root, top)?;
-                saved.push(p.clone());
-                folders.insert(top, p.clone());
+                partial.saved.push(p.clone());
+                partial.folders.insert(top.to_owned(), p.clone());
                 p
             }
         };
@@ -912,41 +1091,67 @@ fn receive_entries(
         let parent = dest.parent().ok_or_else(|| fail("路径无效"))?;
         fs::create_dir_all(parent)?;
         progress.file(&e.path);
-        let temp = receive_file(ch, e.size, parent, cancel, &mut progress)?;
+        let temp = receive_file(ch, e.size, parent, partial, cancel, &mut progress)?;
         temp.persist_noclobber(&dest).map_err(|e| e.error)?;
+        partial.files_done += 1;
         progress.file_done();
     }
     progress.publish();
     Ok(())
 }
 
+/// Receive one file, continuing the part kept from an earlier attempt when
+/// there is one. While it arrives it is `partial.current`, so that a break
+/// can keep it.
 fn receive_file(
     ch: &mut Secure,
     size: u64,
     dir: &Path,
+    partial: &mut Partial,
     cancel: &AtomicBool,
     progress: &mut Progress,
 ) -> Result<tempfile::NamedTempFile> {
-    let mut temp = tempfile::Builder::new()
-        .prefix(".lantransfer-")
-        .tempfile_in(dir)?;
     let mut hash = Sha256::new();
     let mut done = 0;
-    while done < size {
-        cancelled(cancel)?;
-        let data = ch.recv()?;
-        if data.is_empty() || data.len() as u64 > size - done {
-            return Err(fail("文件长度异常"));
+    let temp = match partial.part.take() {
+        Some(part) => {
+            let mut file = fs::OpenOptions::new().read(true).append(true).open(&part)?;
+            done = io::copy(&mut file, &mut hash)?;
+            progress.skip(done);
+            tempfile::NamedTempFile::from_parts(file, tempfile::TempPath::try_from_path(part)?)
         }
-        temp.write_all(data)?;
-        hash.update(data);
-        done += data.len() as u64;
-        progress.add(data.len());
+        None => tempfile::Builder::new()
+            .prefix(".lantransfer-")
+            .tempfile_in(dir)?,
+    };
+    let temp = partial.current.insert(temp);
+    let mut corrupt = false;
+    let outcome = (|| -> Result<()> {
+        while done < size {
+            cancelled(cancel)?;
+            let data = ch.recv()?;
+            if data.is_empty() || data.len() as u64 > size - done {
+                corrupt = true;
+                return Err(fail("文件长度异常"));
+            }
+            temp.write_all(data)?;
+            hash.update(data);
+            done += data.len() as u64;
+            progress.add(data.len());
+        }
+        cancelled(cancel)?;
+        if done != size || ch.recv()? != hash.finalize().as_slice() {
+            corrupt = true;
+            return Err(fail("文件校验失败：内容在传输中损坏"));
+        }
+        Ok(())
+    })();
+    if corrupt {
+        // Data that failed its check cannot be continued.
+        let _ = temp.as_file().set_len(0);
     }
-    cancelled(cancel)?;
-    if ch.recv()? != hash.finalize().as_slice() {
-        return Err(fail("文件校验失败：内容在传输中损坏"));
-    }
+    outcome?;
+    let temp = partial.current.take().expect("set above");
     mark_received(temp.path());
     Ok(temp)
 }
@@ -1025,6 +1230,24 @@ fn claim_folder(root: &Path, name: &str) -> Result<PathBuf> {
 }
 
 // ───────────────────────────── sending ─────────────────────────────
+
+/// Names a batch for resuming: the same files, unchanged since, give the
+/// same key.
+fn batch_key(sources: &[Source]) -> String {
+    let mut hash = Sha256::new();
+    for s in sources {
+        hash.update(s.entry.path.as_bytes());
+        hash.update([0, s.entry.dir as u8]);
+        hash.update(s.entry.size.to_le_bytes());
+        let modified = fs::metadata(&s.path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        hash.update(modified.to_le_bytes());
+    }
+    to_hex(&hash.finalize()[..16])
+}
 
 pub enum Payload {
     Files(Vec<PathBuf>),
@@ -1112,7 +1335,8 @@ fn send_batch(
                 }
             });
             let entries = sources.iter().map(|s| s.entry.clone()).collect();
-            (Offer::Files { entries }, sources)
+            let resume = batch_key(&sources);
+            (Offer::Files { entries, resume }, sources)
         }
     };
     cancelled(cancel)?;
@@ -1145,12 +1369,27 @@ fn send_batch(
     if sources.is_empty() {
         return Ok(());
     }
+    let files = sources.iter().filter(|s| !s.entry.dir).count();
+    let at = reply.resume.unwrap_or(ResumeAt {
+        files: 0,
+        offset: 0,
+    });
+    let next = sources.iter().filter(|s| !s.entry.dir).nth(at.files);
+    if at.files > files || next.map_or(at.offset > 0, |s| at.offset > s.entry.size) {
+        return Err(fail("对方要求的续传位置无效"));
+    }
     configure(ch.stream(), Duration::from_secs(30))?;
     shared.update(id, |t| t.stage = Stage::Running);
     let mut progress = Progress::new(shared, id);
     let mut buf = vec![0; CHUNK];
-    for s in sources.iter().filter(|s| !s.entry.dir) {
+    for (i, s) in sources.iter().filter(|s| !s.entry.dir).enumerate() {
         cancelled(cancel)?;
+        if i < at.files {
+            // The receiver kept it from an earlier attempt.
+            progress.skip(s.entry.size);
+            progress.file_done();
+            continue;
+        }
         progress.file(&s.entry.path);
         let changed = || {
             fail(format!(
@@ -1164,6 +1403,16 @@ fn send_batch(
         }
         let mut hash = Sha256::new();
         let mut left = s.entry.size;
+        if i == at.files && at.offset > 0 {
+            // The receiver has the start of this file; it still gets the
+            // hash of all of it.
+            let copied = io::copy(&mut (&mut file).take(at.offset), &mut hash)?;
+            if copied != at.offset {
+                return Err(changed());
+            }
+            left -= at.offset;
+            progress.skip(at.offset);
+        }
         while left > 0 {
             cancelled(cancel)?;
             let want = (left as usize).min(CHUNK);

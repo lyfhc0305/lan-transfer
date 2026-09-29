@@ -383,6 +383,69 @@ fn receiver_cancel_stops_the_sender_and_removes_partial_files() {
 }
 
 #[test]
+fn a_batch_that_broke_off_continues_where_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("recv");
+    let (small, big) = (dir.path().join("a.txt"), dir.path().join("big.bin"));
+    fs::write(&small, b"hello").unwrap();
+    fs::write(&big, data(64 * 1024 * 1024)).unwrap();
+    let sender = shared(dir.path());
+    let receiver = trusting(&dest, &sender);
+    let (addr, h) = one_server(receiver.clone());
+    // The sender goes away in the middle of the big file.
+    let id = start(&sender, addr, files(&[&small, &big]));
+    wait_for(|| {
+        receiver
+            .transfers
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|t| t.done > 8 * 1024 * 1024)
+    });
+    sender
+        .transfer(id)
+        .unwrap()
+        .cancel
+        .store(true, Ordering::Relaxed);
+    assert!(!h.join().unwrap());
+    let first = receiver.transfers.lock().unwrap()[0].clone();
+    assert_eq!(first.stage, Stage::Failed);
+    assert!(first.detail.contains("已保留进度"), "{}", first.detail);
+    let parts: Vec<String> = tree(&dest)
+        .into_iter()
+        .filter(|n| n.ends_with(".part"))
+        .collect();
+    assert_eq!(parts.len(), 1, "{:?}", tree(&dest));
+
+    // Sending the same files again finishes them without starting over:
+    // a.txt is not received a second time and the part is used up.
+    let (addr, h) = one_server(receiver.clone());
+    let t = send_now(&sender, addr, files(&[&small, &big]));
+    assert_eq!(t.stage, Stage::Done, "{}", t.detail);
+    assert!(h.join().unwrap());
+    assert_eq!(tree(&dest), ["a.txt", "big.bin"]);
+    assert_eq!(
+        fs::read(dest.join("big.bin")).unwrap(),
+        fs::read(&big).unwrap()
+    );
+    let second = receiver.transfers.lock().unwrap()[1].clone();
+    assert_eq!(second.saved, [dest.join("a.txt"), dest.join("big.bin")]);
+
+    // An edited file gives the batch a new name, so it is not continued.
+    let key = || {
+        batch_key(
+            &scan(std::slice::from_ref(&small), &AtomicBool::new(false))
+                .unwrap()
+                .0,
+        )
+    };
+    let before = key();
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&small, b"HELLO").unwrap();
+    assert_ne!(key(), before);
+}
+
+#[test]
 fn a_changed_identity_stops_sending() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("f"), b"x").unwrap();
@@ -507,7 +570,11 @@ fn raw_client(addr: SocketAddr, entries: Vec<Entry>) -> Secure {
         platform: Platform::Other,
     };
     let (mut ch, _) = wire::connect(stream, &Identity::generate(), &me).unwrap();
-    ch.send_json(&Offer::Files { entries }).unwrap();
+    ch.send_json(&Offer::Files {
+        entries,
+        resume: String::new(),
+    })
+    .unwrap();
     ch
 }
 

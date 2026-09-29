@@ -6,6 +6,7 @@ mod network;
 mod notify;
 #[cfg(windows)]
 mod registry;
+mod resume;
 mod ui;
 mod update;
 mod wire;
