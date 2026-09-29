@@ -1,0 +1,61 @@
+# Builds the Mac universal and Windows x64 packages with scripts/build_release.py
+# on a macOS runner, the same way scripts/mac_build_install.command does locally.
+# Every run keeps the packages as a downloadable artifact; pushing a v* tag also
+# attaches them to a GitHub Release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-14
+    env:
+      LLVM_MINGW: llvm-mingw-20260908-ucrt-macos-universal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Fetch LLVM-MinGW (Windows cross toolchain)
+        run: |
+          mkdir -p .build-tools
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/$LLVM_MINGW.tar.xz" \
+            | tar -xJ -C .build-tools
+          test -x ".build-tools/$LLVM_MINGW/bin/x86_64-w64-mingw32-clang"
+
+      - name: Build packages
+        run: python3 scripts/build_release.py
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanTransfer-${{ github.ref_name == 'main' && 'main' || github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.dmg dist/SHA256SUMS.txt \
+            --title "邻传 $GITHUB_REF_NAME" --generate-notes
