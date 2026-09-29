@@ -450,10 +450,12 @@ impl App {
                             .desired_rows(6)
                             .desired_width(f32::INFINITY)
                             .lock_focus(true);
-                        egui::ScrollArea::vertical()
+                        let edit = egui::ScrollArea::vertical()
                             .id_salt("text-scroll")
                             .max_height(260.)
-                            .show(ui, |ui| ui.add(edit));
+                            .show(ui, |ui| ui.add(edit))
+                            .inner;
+                        widgets::edit_menu(&edit, &self.text);
                     });
                 widgets::separator(ui);
                 Frame::new()

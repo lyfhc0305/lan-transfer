@@ -29,7 +29,20 @@ enum Action {
     Reveal(PathBuf),
     OpenFolder,
     Copy(String),
+    CopyFiles(Vec<PathBuf>),
+    Select(u64),
     Retry(u64),
+}
+
+/// Files a finished transfer can put on the clipboard: what was sent, or
+/// what was received and saved.
+fn copyable_files(t: &Transfer) -> &[PathBuf] {
+    match (&t.text, t.outgoing, t.stage) {
+        (Some(_), _, _) => &[],
+        (None, true, _) => &t.sources,
+        (None, false, Stage::Done) => &t.saved,
+        _ => &[],
+    }
 }
 
 impl App {
@@ -105,14 +118,29 @@ impl App {
                     if i > 0 {
                         widgets::separator(ui);
                     }
-                    if let Some(a) = transfer_row(ui, t) {
+                    let selected = self.selected_transfer == Some(t.id);
+                    if let Some(a) = transfer_row(ui, t, selected) {
                         action = Some(a);
                     }
                 }
             });
             ui.add_space(14.);
         }
+        // ⌘/Ctrl+C copies the selected row's files (or text), to paste in
+        // Finder or Explorer.
+        let copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        if copy && action.is_none() && !ui.ctx().wants_keyboard_input() {
+            let t = transfers
+                .iter()
+                .find(|t| Some(t.id) == self.selected_transfer && t.stage.finished());
+            action = t.map(|t| match &t.text {
+                Some(text) => Action::Copy(text.clone()),
+                None => Action::CopyFiles(copyable_files(t).to_vec()),
+            });
+        }
         match action {
+            Some(Action::Select(id)) => self.selected_transfer = Some(id),
+            Some(Action::CopyFiles(files)) => self.copy_files(&files),
             Some(Action::Cancel(id)) => {
                 if let Some(t) = self.shared.transfer(id) {
                     t.cancel.store(true, Ordering::Relaxed);
@@ -147,6 +175,35 @@ impl App {
         }
     }
 
+    fn copy_files(&mut self, files: &[PathBuf]) {
+        // Only files that are still there; the list may be old.
+        let files: Vec<&PathBuf> = files.iter().filter(|f| f.exists()).collect();
+        if files.is_empty() {
+            self.notify(Tone::Info, "文件已不在原来的位置。");
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let copied = match &mut self.clipboard {
+            Some(c) => c.set().file_list(&files).is_ok(),
+            None => false,
+        };
+        if copied {
+            let place = if cfg!(target_os = "macos") {
+                "访达"
+            } else {
+                "资源管理器"
+            };
+            self.notify(
+                Tone::Success,
+                format!("已复制 {} 项，可在{place}中粘贴。", files.len()),
+            );
+        } else {
+            self.notify(Tone::Error, "无法复制到剪贴板。");
+        }
+    }
+
     fn retry(&mut self, id: u64) {
         let Some(t) = self.shared.transfer(id) else {
             return;
@@ -167,10 +224,43 @@ impl App {
     }
 }
 
-fn transfer_row(ui: &mut Ui, t: &Transfer) -> Option<Action> {
+fn transfer_row(ui: &mut Ui, t: &Transfer, selected: bool) -> Option<Action> {
     let p = pal(ui);
     let mut action = None;
     let running = !t.stage.finished();
+    // Finished rows can be selected (for ⌘/Ctrl+C) and right-clicked. The
+    // row's area comes from the last frame so that the buttons drawn on
+    // top of it keep their clicks.
+    let row_id = ui.id().with(("transfer-row", t.id));
+    let files = copyable_files(t);
+    let copyable = !running && (t.text.is_some() || !files.is_empty());
+    let last_rect = ui.ctx().data(|d| d.get_temp::<Rect>(row_id));
+    if let (true, Some(rect)) = (copyable, last_rect) {
+        let row = ui.interact(rect, row_id, Sense::click());
+        if selected {
+            ui.painter()
+                .rect_filled(rect.expand2(vec2(8., -2.)), 8, p.accent_soft);
+        }
+        if row.clicked() || row.secondary_clicked() {
+            action = Some(Action::Select(t.id));
+        }
+        row.context_menu(|ui| {
+            ui.set_min_width(180.);
+            let label = if t.text.is_some() {
+                "复制文字"
+            } else {
+                "复制文件"
+            };
+            if widgets::menu_item(ui, Icon::Copy, label, false).clicked() {
+                action = Some(match &t.text {
+                    Some(text) => Action::Copy(text.clone()),
+                    None => Action::CopyFiles(files.to_vec()),
+                });
+                ui.close_menu();
+            }
+        });
+    }
+    let top = ui.cursor().top();
     let (fg, bg) = match t.stage {
         _ if running => (p.accent, p.accent_soft),
         Stage::Done => (p.success, p.success_soft),
@@ -300,6 +390,8 @@ fn transfer_row(ui: &mut Ui, t: &Transfer) -> Option<Action> {
         });
     });
     ui.add_space(10.);
+    let rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+    ui.ctx().data_mut(|d| d.insert_temp(row_id, rect));
     action
 }
 

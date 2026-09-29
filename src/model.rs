@@ -424,11 +424,13 @@ pub struct Message {
 
 /// Something that happened in the background, shown once as a notice.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Paste
 pub enum Event {
     Received { id: u64 },
     Sent { id: u64 },
     Failed { id: u64 },
     Note(String),
+    Paste, // chosen from the macOS Edit menu
 }
 
 pub struct Shared {

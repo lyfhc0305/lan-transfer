@@ -24,6 +24,7 @@ impl App {
                             .margin(Margin::symmetric(8, 5))
                             .desired_width(186.),
                     );
+                    widgets::edit_menu(&edit, &self.name_draft);
                     let commit = edit.lost_focus()
                         || (edit.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
                     if commit {

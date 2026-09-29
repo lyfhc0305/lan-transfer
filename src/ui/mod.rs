@@ -129,6 +129,14 @@ pub struct App {
     /// they have stopped (so temporary files are removed) or after 2 s.
     exit_deadline: Option<Instant>,
     exiting: bool,
+    /// Row picked on the transfers page, for ⌘/Ctrl+C.
+    selected_transfer: Option<u64>,
+    /// Kept open: on Linux the copied files are served only while it lives.
+    clipboard: Option<arboard::Clipboard>,
+    /// A V key press was seen and its release is still to come.
+    v_pressed: bool,
+    /// ⌘/Ctrl+V was pressed this frame.
+    paste_key: bool,
     addresses: Vec<Ipv4Addr>,
     addresses_at: Option<Instant>,
     content_top: f32,
@@ -159,6 +167,10 @@ impl App {
             exit_confirm: false,
             exit_deadline: None,
             exiting: false,
+            selected_transfer: None,
+            clipboard: None,
+            v_pressed: false,
+            paste_key: false,
             addresses: vec![],
             addresses_at: None,
             content_top: 64.,
@@ -191,6 +203,23 @@ impl App {
             action: Some((label.to_owned(), action)),
             shown: Instant::now(),
         });
+    }
+
+    /// Files dropped on the window or pasted: add them and show them.
+    fn add_dropped(&mut self, paths: Vec<PathBuf>) {
+        self.add_paths(paths);
+        self.mode = Mode::Files;
+        self.page = Page::Home;
+    }
+
+    /// Adds the files and folders on the clipboard, if there are any.
+    fn paste_files(&mut self) {
+        let files = arboard::Clipboard::new().and_then(|mut c| c.get().file_list());
+        if let Ok(paths) = files {
+            if !paths.is_empty() {
+                self.add_dropped(paths);
+            }
+        }
     }
 
     pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
@@ -326,6 +355,16 @@ impl App {
                     }
                 }
                 Event::Note(text) => self.notify(Tone::Info, text),
+                Event::Paste => {
+                    let ctx = self.shared.ctx.clone();
+                    if ctx.wants_keyboard_input() {
+                        if let Some(e) = widgets::edit_event(Key::V) {
+                            widgets::queue_edit_command(&ctx, None, e);
+                        }
+                    } else {
+                        self.paste_files();
+                    }
+                }
             }
         }
     }
@@ -679,6 +718,28 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
+
+    fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        widgets::control_click_as_right_click(ctx, raw_input);
+        // egui-winit turns the ⌘/Ctrl+V press into a text paste, or into
+        // nothing when the clipboard holds only files, but passes on the
+        // release. A V release without its press is therefore a paste
+        // (Command may already be up by then, so its state does not tell).
+        // On the Mac the Edit menu takes the press and the same applies.
+        for event in &raw_input.events {
+            if let egui::Event::Key {
+                key: Key::V,
+                pressed,
+                ..
+            } = event
+            {
+                if !*pressed && !self.v_pressed {
+                    self.paste_key = true;
+                }
+                self.v_pressed = *pressed;
+            }
+        }
+    }
 }
 
 impl App {
@@ -723,6 +784,7 @@ impl App {
             }
         }
         self.shortcuts(ctx);
+        widgets::run_edit_command(ctx);
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -731,9 +793,12 @@ impl App {
                 .collect::<Vec<_>>()
         });
         if !dropped.is_empty() {
-            self.add_paths(dropped);
-            self.mode = Mode::Files;
-            self.page = Page::Home;
+            self.add_dropped(dropped);
+        }
+        // ⌘/Ctrl+V outside a text field adds files copied in Finder or
+        // Explorer.
+        if std::mem::take(&mut self.paste_key) && !ctx.wants_keyboard_input() {
+            self.paste_files();
         }
         for f in &mut self.picked {
             if let Some(rx) = &f.counting {
