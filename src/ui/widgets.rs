@@ -774,9 +774,9 @@ pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str, danger: bool) -> Response
 }
 
 /// Right-click menu for a text field: cut, copy, paste and select all.
-/// ⌘/Ctrl+X, C, V and A already work through egui; each item sends the same
-/// command to the field on the next frame (see `run_edit_command`), so the
-/// selection, undo and `char_limit` behave exactly as with the keyboard.
+/// Each item sends the field the same command as the keyboard shortcut, on
+/// the next frame (see `run_edit_command`), so the selection, undo and
+/// `char_limit` behave exactly as with the keyboard.
 pub fn edit_menu(response: &Response, text: &str) {
     let ctx = &response.ctx;
     let id = response.id;
@@ -799,52 +799,72 @@ pub fn edit_menu(response: &Response, text: &str) {
     response.context_menu(|ui| {
         ui.set_min_width(180.);
         let mut command = None;
-        if shortcut_item(ui, "剪切", Key::X, selected).clicked() {
-            command = Some(Event::Cut);
-        }
-        if shortcut_item(ui, "复制", Key::C, selected).clicked() {
-            command = Some(Event::Copy);
-        }
-        if shortcut_item(ui, "粘贴", Key::V, true).clicked() {
-            // egui cannot read the clipboard itself; the keyboard shortcut
-            // gets the text from egui-winit, the menu from arboard.
-            let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
-            command = pasted.ok().map(|t| Event::Paste(t.replace("\r\n", "\n")));
-        }
-        ui.add_space(2.);
-        separator(ui);
-        ui.add_space(2.);
-        if shortcut_item(ui, "全选", Key::A, !text.is_empty()).clicked() {
-            command = Some(Event::Key {
-                key: Key::A,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::COMMAND,
-            });
+        for (label, key, enabled) in [
+            ("剪切", Key::X, selected),
+            ("复制", Key::C, selected),
+            ("粘贴", Key::V, true),
+            ("全选", Key::A, !text.is_empty()),
+        ] {
+            if key == Key::A {
+                ui.add_space(2.);
+                separator(ui);
+                ui.add_space(2.);
+            }
+            if shortcut_item(ui, label, key, enabled).clicked() {
+                command = edit_event(key);
+            }
         }
         if let Some(event) = command {
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(Id::new(EDIT_COMMAND), Some((id, event))));
-            ui.ctx().request_repaint();
+            queue_edit_command(ui.ctx(), Some(id), event);
             ui.close_menu();
         }
     });
 }
 
+/// The egui event that ⌘/Ctrl + `key` produces for cut, copy, paste or
+/// select all. egui cannot read the clipboard itself: the keyboard shortcut
+/// gets the text from egui-winit, the menus from arboard.
+pub fn edit_event(key: Key) -> Option<Event> {
+    match key {
+        Key::X => Some(Event::Cut),
+        Key::C => Some(Event::Copy),
+        Key::V => {
+            let pasted = arboard::Clipboard::new().and_then(|mut c| c.get_text());
+            pasted.ok().map(|t| Event::Paste(t.replace("\r\n", "\n")))
+        }
+        Key::A => Some(Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }),
+        _ => None,
+    }
+}
+
 const EDIT_COMMAND: &str = "edit-menu-command";
 
-/// Hands the command picked in an `edit_menu` to its field, as if typed.
+/// Sends an edit command to `field`, or to whatever has keyboard focus, at
+/// the start of the next frame (see `run_edit_command`).
+pub fn queue_edit_command(ctx: &egui::Context, field: Option<Id>, event: Event) {
+    ctx.data_mut(|d| d.insert_temp(Id::new(EDIT_COMMAND), Some((field, event))));
+    ctx.request_repaint();
+}
+
+/// Hands a queued edit command to its field, as if typed.
 /// Called at the start of the frame, before any text field is shown.
 pub fn run_edit_command(ctx: &egui::Context) {
     let key = Id::new(EDIT_COMMAND);
     let Some((field, event)) = ctx
-        .data_mut(|d| d.remove_temp::<Option<(Id, Event)>>(key))
+        .data_mut(|d| d.remove_temp::<Option<(Option<Id>, Event)>>(key))
         .flatten()
     else {
         return;
     };
-    ctx.memory_mut(|m| m.request_focus(field));
+    if let Some(field) = field {
+        ctx.memory_mut(|m| m.request_focus(field));
+    }
     ctx.input_mut(|i| i.events.push(event));
 }
 
