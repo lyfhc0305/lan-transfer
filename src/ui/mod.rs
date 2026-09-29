@@ -129,6 +129,10 @@ pub struct App {
     /// they have stopped (so temporary files are removed) or after 2 s.
     exit_deadline: Option<Instant>,
     exiting: bool,
+    /// Row picked on the transfers page, for ⌘/Ctrl+C.
+    selected_transfer: Option<u64>,
+    /// Kept open: on Linux the copied files are served only while it lives.
+    clipboard: Option<arboard::Clipboard>,
     /// A V key press was seen and its release is still to come.
     v_pressed: bool,
     /// ⌘/Ctrl+V was pressed this frame.
@@ -163,6 +167,8 @@ impl App {
             exit_confirm: false,
             exit_deadline: None,
             exiting: false,
+            selected_transfer: None,
+            clipboard: None,
             v_pressed: false,
             paste_key: false,
             addresses: vec![],
