@@ -1,0 +1,10 @@
+/target/
+/received/
+*.key
+__pycache__/
+/.build-tools/
+/dist/
+/localsend/
+/.test-work/
+/备份-*/
+.DS_Store
